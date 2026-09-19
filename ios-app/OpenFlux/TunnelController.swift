@@ -3,12 +3,18 @@ import Combine
 
 enum TransportKind: String, CaseIterable, Identifiable {
     case yandex = "yandex"
+    case vyandex = "vyandex"
     case max = "oneme"
+    case cupsonline = "cupsonline"
+    case mailru = "mailru"
     var id: String { rawValue }
     var title: String {
         switch self {
         case .yandex: return "Yandex Docs"
+        case .vyandex: return "Yandex Volga"
         case .max: return "MAX"
+        case .cupsonline: return "Cups.online"
+        case .mailru: return "Mail.ru Docs"
         }
     }
 }
@@ -28,8 +34,13 @@ final class TunnelController: ObservableObject {
 
     /// Starts the client tunnel over the selected transport.
     /// - port: local SOCKS5 port to listen on (127.0.0.1:port).
-    func start(transport: TransportKind, url: String, maxToken: String, maxUid: String, port: Int) {
+    func start(transport: TransportKind, url: String, maxToken: String, maxUid: String,
+               peerKey: String, port: Int) {
         guard !running else { return }
+        OpenFluxSetAllowPlaintext(0)
+        peerKey.withCString { key in
+            OpenFluxSetPeerKey(UnsafeMutablePointer(mutating: key))
+        }
         let addr = "127.0.0.1:\(port)"
         socksAddr = addr
 

@@ -8,6 +8,7 @@ struct ContentView: View {
     @AppStorage("docURL") private var docURL: String = ""
     @AppStorage("maxToken") private var maxToken: String = ""
     @AppStorage("maxUid") private var maxUid: String = ""
+    @AppStorage("peerKey") private var peerKey: String = ""
     // Uncommon default port to avoid clashing with other local proxies.
     @AppStorage("socksPort") private var socksPort: String = "10808"
     @AppStorage("debugLog") private var debugLog: Bool = false
@@ -18,9 +19,11 @@ struct ContentView: View {
     }
 
     private var canStart: Bool {
-        guard (Int(socksPort) ?? 0) > 0 else { return false }
+        guard (Int(socksPort) ?? 0) > 0,
+              !peerKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         switch transport {
-        case .yandex: return !docURL.trimmingCharacters(in: .whitespaces).isEmpty
+        case .yandex, .vyandex, .cupsonline, .mailru:
+            return !docURL.trimmingCharacters(in: .whitespaces).isEmpty
         case .max:    return !maxToken.isEmpty && !maxUid.isEmpty
         }
     }
@@ -36,10 +39,19 @@ struct ContentView: View {
                             Text(t.title).tag(t.rawValue)
                         }
                     }
-                    .pickerStyle(.segmented)
-                    .disabled(tunnel.running)
+                    .pickerStyle(.menu)
+                    .disabled(tunnel.running || vpn.active)
 
                     connectionFields
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Exit public key (Noise)").font(.caption).foregroundColor(.secondary)
+                        SecureField("base64 X25519 public key", text: $peerKey)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled(true)
+                            .textFieldStyle(.roundedBorder)
+                            .disabled(tunnel.running || vpn.active)
+                    }
 
                     portField
 
@@ -68,9 +80,9 @@ struct ContentView: View {
     @ViewBuilder
     private var connectionFields: some View {
         switch transport {
-        case .yandex:
-            field(title: "Yandex Docs URL",
-                  placeholder: "https://docs.yandex.ru/docs/view?url=...",
+        case .yandex, .vyandex, .cupsonline, .mailru:
+            field(title: transport.title + " URL / room data",
+                  placeholder: transport == .mailru ? "https://cloud.mail.ru/public/..." : "Document or room URL",
                   text: $docURL)
         case .max:
             field(title: "MAX token", placeholder: "auth token", text: $maxToken)
@@ -85,7 +97,7 @@ struct ContentView: View {
             TextField("10808", text: $socksPort)
                 .keyboardType(.numberPad)
                 .textFieldStyle(.roundedBorder)
-                .disabled(tunnel.running)
+                .disabled(tunnel.running || vpn.active)
         }
     }
 
@@ -103,12 +115,13 @@ struct ContentView: View {
                                      url: docURL,
                                      maxToken: maxToken,
                                      maxUid: maxUid,
+                                     peerKey: peerKey,
                                      port: Int(socksPort) ?? 10808)
                     } label: {
                         Label("Start", systemImage: "play.fill").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!canStart)
+                    .disabled(!canStart || vpn.active)
                 }
                 Button { tunnel.testThroughProxy() } label: {
                     Label("Test", systemImage: "network").frame(maxWidth: .infinity)
@@ -139,12 +152,12 @@ struct ContentView: View {
             } else {
                 Button {
                     vpn.start(transport: transport.rawValue, url: docURL,
-                              maxToken: maxToken, maxUid: maxUid)
+                              maxToken: maxToken, maxUid: maxUid, peerKey: peerKey)
                 } label: {
                     Label("Start VPN", systemImage: "bolt.fill").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!canStart)
+                .disabled(!canStart || tunnel.running)
             }
             Text("Routes the whole device through the exit node (TCP + DNS-over-TCP).")
                 .font(.caption2).foregroundColor(.secondary)
@@ -160,7 +173,7 @@ struct ContentView: View {
                 .autocorrectionDisabled(true)
                 .keyboardType(keyboard)
                 .textFieldStyle(.roundedBorder)
-                .disabled(tunnel.running)
+                .disabled(tunnel.running || vpn.active)
         }
     }
 

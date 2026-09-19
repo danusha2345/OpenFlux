@@ -21,6 +21,8 @@ import (
 
 	"openflux/network"
 	"openflux/transport"
+	"openflux/transport/cupsonline"
+	"openflux/transport/mailru"
 	"openflux/transport/oneme"
 	"openflux/utils"
 )
@@ -82,6 +84,10 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	switch tt {
 	case "yandex", "", "vyandex":
 		t, err = newBridgeDocStreams(tt, docURL, enc, config)
+	case "mailru":
+		t, err = newBridgeStream(mailru.NewMailruDocsTransport(docURL, config), enc)
+	case "cupsonline":
+		t, err = newBridgeStream(cupsonline.NewCupsonlineTransport(docURL, config, true), enc)
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
 		t, err = newBridgeStream(oneme.NewOneMeTransport(false, mToken, uidint, config), enc)
@@ -182,8 +188,8 @@ func sendICMPPortUnreachable(orig []byte, outQ chan []byte) {
 	ip := make([]byte, total)
 	ip[0] = 0x45
 	binary.BigEndian.PutUint16(ip[2:4], uint16(total))
-	ip[8] = 64 // TTL
-	ip[9] = 1  // ICMP
+	ip[8] = 64                   // TTL
+	ip[9] = 1                    // ICMP
 	copy(ip[12:16], orig[16:20]) // src = original destination
 	copy(ip[16:20], orig[12:16]) // dst = original source (the device)
 	ck2 := network.IPChecksum(ip[:20])
@@ -204,43 +210,58 @@ var dnsSem = make(chan struct{}, 16)
 //
 //export OpenFluxTunReadPacket
 func OpenFluxTunReadPacket(buf *C.char, max C.int) C.int {
+	defer func() { _ = recover() }()
+	if buf == nil || max <= 0 {
+		return -1
+	}
 	ptMu.Lock()
 	outQ := ptOutQ
 	ctx := ptCtx
 	ptMu.Unlock()
 	if outQ == nil || ctx == nil {
-		return 0
+		return -1
 	}
-	select {
-	case data := <-outQ:
-		n := len(data)
-		if n > int(max) {
-			n = int(max)
+	for {
+		select {
+		case data := <-outQ:
+			if len(data) == 0 {
+				continue
+			}
+			if len(data) > int(max) {
+				// Truncating an IP packet makes it unusable; drop and wait for
+				// retransmission instead.
+				continue
+			}
+			dst := unsafe.Slice((*byte)(unsafe.Pointer(buf)), int(max))
+			copy(dst[:len(data)], data)
+			return C.int(len(data))
+		case <-ctx.Done():
+			return -1
 		}
-		dst := unsafe.Slice((*byte)(unsafe.Pointer(buf)), int(max))
-		copy(dst[:n], data[:n])
-		return C.int(n)
-	case <-ctx.Done():
-		return 0
 	}
 }
 
 //export OpenFluxStopPacketTunnel
 func OpenFluxStopPacketTunnel() {
 	ptMu.Lock()
-	defer ptMu.Unlock()
 	if !ptOn {
+		ptMu.Unlock()
 		return
 	}
-	if ptCancel != nil {
-		ptCancel()
-	}
-	if ptTrans != nil {
-		ptTrans.Stop()
-	}
+	cancel := ptCancel
+	t := ptTrans
 	ptTrans = nil
 	ptOutQ = nil
+	ptCtx = nil
+	ptCancel = nil
 	ptOn = false
+	ptMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if t != nil {
+		t.Stop()
+	}
 	utils.Debugf("[PKT] L3 packet tunnel stopped")
 }
 
@@ -275,8 +296,8 @@ func handleDNSPacket(req []byte, outQ chan []byte) {
 	resp[0] = req[0]
 	resp[1] = req[1]
 	binary.BigEndian.PutUint16(resp[2:4], uint16(total))
-	resp[8] = 64 // TTL
-	resp[9] = 17 // UDP
+	resp[8] = 64              // TTL
+	resp[9] = 17              // UDP
 	copy(resp[12:16], dstIP)  // src = original destination (the resolver)
 	copy(resp[16:20], srcIP)  // dst = the device
 	resp[10], resp[11] = 0, 0 // checksum field

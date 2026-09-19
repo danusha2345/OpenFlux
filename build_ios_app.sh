@@ -9,7 +9,7 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP_DIR="$ROOT/ios-app"
-TEAM_ID="8GQH8GQ252"
+TEAM_ID="${TEAM_ID:-8GQH8GQ252}"
 
 echo "==> [1/5] Building Go static library (arm64, iOS)"
 "$ROOT/build_ios.sh"
@@ -28,6 +28,7 @@ rm -rf build/OpenFlux.xcarchive
 xcodebuild -project OpenFlux.xcodeproj -scheme OpenFlux -configuration Release \
   -destination 'generic/platform=iOS' \
   -archivePath build/OpenFlux.xcarchive \
+  DEVELOPMENT_TEAM="$TEAM_ID" \
   -allowProvisioningUpdates \
   clean archive
 

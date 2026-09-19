@@ -26,19 +26,22 @@ final class VPNController: ObservableObject {
         refreshStatus()
     }
 
-    func start(transport: String, url: String, maxToken: String, maxUid: String) {
+    func start(transport: String, url: String, maxToken: String, maxUid: String, peerKey: String) {
         Task {
+            if manager == nil { await load() }
             let m = manager ?? NETunnelProviderManager()
             let proto = NETunnelProviderProtocol()
             proto.providerBundleIdentifier = extensionBundleId
             proto.serverAddress = "OpenFlux"
             proto.providerConfiguration = [
                 "transport": transport, "url": url,
-                "maxToken": maxToken, "maxUid": maxUid,
+                "maxToken": maxToken, "maxUid": maxUid, "peerKey": peerKey,
             ]
             m.protocolConfiguration = proto
             m.localizedDescription = "OpenFlux"
             m.isEnabled = true
+            m.onDemandRules = [NEOnDemandRuleConnect()]
+            m.isOnDemandEnabled = true
             do {
                 try await m.saveToPreferences()
                 try await m.loadFromPreferences()   // required before starting
@@ -51,7 +54,12 @@ final class VPNController: ObservableObject {
     }
 
     func stop() {
-        manager?.connection.stopVPNTunnel()
+        guard let manager else { return }
+        Task {
+            manager.isOnDemandEnabled = false
+            try? await manager.saveToPreferences()
+            manager.connection.stopVPNTunnel()
+        }
     }
 
     @objc private func statusChanged() { refreshStatus() }

@@ -102,3 +102,25 @@ jobs:
         with:
           name: liboflux-ios-arm64
           path: output/ios/liboflux.a
+      - name: install xcodegen
+        run: brew install xcodegen
+      - name: build unsigned iPhone app
+        run: |
+          mkdir -p ios-app/Lib ios-app/build/Payload
+          cp output/ios/liboflux.a ios-app/Lib/liboflux.a
+          cp output/ios/liboflux.h ios-app/Lib/liboflux.h
+          cd ios-app
+          xcodegen generate
+          xcodebuild -project OpenFlux.xcodeproj -scheme OpenFlux \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            DEVELOPMENT_TEAM='' build
+          cp -R build/DerivedData/Build/Products/Release-iphoneos/OpenFlux.app build/Payload/
+          cd build
+          zip -qry OpenFlux-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenFlux-iOS-unsigned
+          path: ios-app/build/OpenFlux-unsigned.ipa

@@ -1,33 +1,11 @@
+import Foundation
 import NetworkExtension
 
 /// System VPN entry point. Bridges the device's IP packets to the OpenFlux Go
 /// tun2socks stack (TCP forwarded through the transport; DNS proxied over TCP).
 class PacketTunnelProvider: NEPacketTunnelProvider {
-
-    /// Networks that must NOT go through the tunnel: the Yandex backend the
-    /// transport talks to, plus the DoT DNS resolvers. Otherwise the
-    /// extension's own traffic loops back into itself.
-    static let bypassRoutes: [NEIPv4Route] = {
-        let cidrs: [(String, String)] = [
-            ("5.45.192.0", "255.255.192.0"),
-            ("5.255.192.0", "255.255.192.0"),
-            ("37.9.64.0", "255.255.192.0"),
-            ("37.140.128.0", "255.255.192.0"),
-            ("77.88.0.0", "255.255.192.0"),
-            ("84.201.128.0", "255.255.192.0"),
-            ("87.250.224.0", "255.255.224.0"),
-            ("90.156.176.0", "255.255.252.0"),
-            ("93.158.128.0", "255.255.192.0"),
-            ("95.108.128.0", "255.255.128.0"),
-            ("100.43.64.0", "255.255.224.0"),
-            ("178.154.128.0", "255.255.128.0"),
-            ("213.180.192.0", "255.255.224.0"),
-            // DoT DNS resolvers used by the Go client.
-            ("8.8.8.8", "255.255.255.255"),
-            ("1.1.1.1", "255.255.255.255"),
-        ]
-        return cidrs.map { NEIPv4Route(destinationAddress: $0.0, subnetMask: $0.1) }
-    }()
+    private let loopStateLock = NSLock()
+    private var stopped = false
 
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
@@ -36,6 +14,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let url = (conf["url"] as? String) ?? ""
         let maxToken = (conf["maxToken"] as? String) ?? ""
         let maxUid = (conf["maxUid"] as? String) ?? ""
+        let peerKey = (conf["peerKey"] as? String) ?? ""
+
+        loopStateLock.lock()
+        stopped = false
+        loopStateLock.unlock()
+        OpenFluxSetAllowPlaintext(0)
+        peerKey.withCString { key in
+            OpenFluxSetPeerKey(UnsafeMutablePointer(mutating: key))
+        }
 
         // Virtual interface: capture all IPv4 + all DNS.
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
@@ -44,11 +31,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // forwarding with no gvisor stack in the extension.
         let ipv4 = NEIPv4Settings(addresses: ["10.10.10.2"], subnetMasks: ["255.255.255.0"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
-        // Exclude the transport's own backend (Yandex ranges) and the DoT DNS
-        // servers so the extension's own connections bypass the tunnel instead
-        // of looping back into it.
-        ipv4.excludedRoutes = Self.bypassRoutes
         settings.ipv4Settings = ipv4
+        // Capture IPv6 as well. The Go packet bridge currently rejects it,
+        // which forces applications to fall back to IPv4 instead of leaking
+        // IPv6 outside the VPN.
+        let ipv6 = NEIPv6Settings(addresses: ["fdfe:dcba:9876::1"], networkPrefixLengths: [126])
+        ipv6.includedRoutes = [NEIPv6Route.default()]
+        settings.ipv6Settings = ipv6
         settings.mtu = 1500
         // A benign in-tunnel DNS address: queries to it are captured and
         // answered locally over DoT (the real resolvers are excluded above).
@@ -86,6 +75,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        loopStateLock.lock()
+        stopped = true
+        loopStateLock.unlock()
         OpenFluxStopPacketTunnel()
         completionHandler()
     }
@@ -94,6 +86,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private func startReadLoop() {
         packetFlow.readPackets { [weak self] packets, _ in
             guard let self = self else { return }
+            self.loopStateLock.lock()
+            let stopped = self.stopped
+            self.loopStateLock.unlock()
+            if stopped { return }
             for p in packets {
                 p.withUnsafeBytes { raw in
                     if let base = raw.bindMemory(to: CChar.self).baseAddress {
@@ -108,12 +104,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Go stack -> device.
     private func startWriteLoop() {
         DispatchQueue.global(qos: .userInitiated).async {
-            let maxLen: Int32 = 4096
+            let maxLen: Int32 = 65535
             let buf = UnsafeMutablePointer<CChar>.allocate(capacity: Int(maxLen))
             defer { buf.deallocate() }
             while true {
                 let n = OpenFluxTunReadPacket(buf, maxLen)
-                if n <= 0 { break }
+                if n < 0 { break }
+                if n == 0 { continue }
                 let data = Data(bytes: buf, count: Int(n))
                 self.packetFlow.writePackets([data], withProtocols: [NSNumber(value: AF_INET)])
             }

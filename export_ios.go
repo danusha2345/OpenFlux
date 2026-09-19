@@ -20,6 +20,8 @@ import (
 
 	"openflux/socks5"
 	"openflux/transport"
+	"openflux/transport/cupsonline"
+	"openflux/transport/mailru"
 	"openflux/transport/oneme"
 	"openflux/transport/yandex"
 	"openflux/tunnel"
@@ -72,11 +74,9 @@ var (
 	// bridgeCfgMu guards the encryption settings above and below; both the
 	// SOCKS and the packet-tunnel bridges read them.
 	bridgeCfgMu sync.Mutex
-	// bridgeAllowPlaintext mirrors --allow-plaintext. It defaults to ON for the
-	// bridges because the shipped iOS app has no key setting yet: without it
-	// every Start would fail with startBadEncryption. Call
-	// OpenFluxSetAllowPlaintext(0) once the app supplies OpenFluxSetPeerKey.
-	bridgeAllowPlaintext = true
+	// Encryption is mandatory by default. The Swift app sets bridgePeerKey
+	// before either SOCKS or packet-tunnel mode starts.
+	bridgeAllowPlaintext bool
 )
 
 func init() {
@@ -139,7 +139,7 @@ const (
 )
 
 // newBridgeDocStreams builds the iOS client transport for one or several
-// comma-separated documents: one legacy-codec stream per document, combined
+// comma-separated documents: one batched stream per document, combined
 // into a MultiStreamTransport when there is more than one.
 func newBridgeDocStreams(transportType, docURL string, enc *encryptionSetup, config transport.TransportConfig) (transport.Transport, error) {
 	var firstErr error
@@ -231,6 +231,10 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 	switch tt {
 	case "yandex", "", "vyandex":
 		t, err = newBridgeDocStreams(tt, docURL, enc, config)
+	case "mailru":
+		t, err = newBridgeStream(mailru.NewMailruDocsTransport(docURL, config), enc)
+	case "cupsonline":
+		t, err = newBridgeStream(cupsonline.NewCupsonlineTransport(docURL, config, true), enc)
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
 		t, err = newBridgeStream(oneme.NewOneMeTransport(false, mToken, uidint, config), enc)

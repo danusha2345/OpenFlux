@@ -28,6 +28,10 @@ type fakeDocServer struct {
 }
 
 func newFakeDocServer(t *testing.T) *fakeDocServer {
+	return newFakeDocServerWithOpen(t, `0{"sid":"srv","upgrades":[],"pingInterval":25000,"pingTimeout":20000}`)
+}
+
+func newFakeDocServerWithOpen(t *testing.T, open string) *fakeDocServer {
 	t.Helper()
 	f := &fakeDocServer{}
 
@@ -43,7 +47,7 @@ func newFakeDocServer(t *testing.T) *fakeDocServer {
 		// Real servers send the engine.io OPEN frame first; the transport now
 		// waits for it before authenticating.
 		_ = conn.WriteMessage(websocket.TextMessage,
-			[]byte(`0{"sid":"srv","upgrades":[],"pingInterval":25000,"pingTimeout":20000}`))
+			[]byte(open))
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
@@ -304,4 +308,26 @@ func TestYandexDocsTransportGreetsPeer(t *testing.T) {
 	if n := srv.countReceived("---KA---"); n != 2 {
 		t.Fatalf("keepalive sent with nobody else in the document (%d total)", n)
 	}
+}
+
+func TestYandexHeartbeatTimeoutReconnects(t *testing.T) {
+	server := newFakeDocServerWithOpen(t, `0{"sid":"srv","pingInterval":30,"pingTimeout":30}`)
+	tr := newTestTransport(server.pageURL)
+	if err := tr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Stop()
+	waitFor(t, "reconnect after missing heartbeat", 6*time.Second, func() bool { return server.connCount() >= 2 })
+}
+
+func TestYandexNamespaceDisconnectReconnects(t *testing.T) {
+	server := newFakeDocServer(t)
+	tr := newTestTransport(server.pageURL)
+	if err := tr.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Stop()
+	waitFor(t, "connected", 3*time.Second, tr.IsConnected)
+	server.push(t, "41")
+	waitFor(t, "namespace reconnect", 6*time.Second, func() bool { return server.connCount() >= 2 })
 }

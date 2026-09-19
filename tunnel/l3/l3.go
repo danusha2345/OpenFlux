@@ -181,7 +181,12 @@ func (t *L3Exit) statsLoop() {
 
 	var lastFromTr, lastToNet, lastFromNet, lastToCli uint64
 
-	for range tick.C {
+	for {
+		select {
+		case <-t.ct.stop:
+			return
+		case <-tick.C:
+		}
 		fromTr := t.pktFromTransport.Load()
 		toNet := t.pktToNetwork.Load()
 		fromNet := t.pktFromNetwork.Load()
@@ -229,4 +234,3 @@ func sliceIPv4(pkt []byte) ([]byte, bool) {
 	}
 	return pkt[:tot], true
 }
-

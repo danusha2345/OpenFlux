@@ -12,6 +12,7 @@ import (
 )
 
 type rawBackend struct {
+	ioMu   sync.RWMutex
 	sendFd int
 	recvFd int
 	egress [4]byte
@@ -48,6 +49,14 @@ func newBackend() (L3Backend, error) {
 	// and the default 208 KiB is not enough at ~100ms RTT for 30+ Mbps.
 	syscall.SetsockoptInt(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 16*1024*1024)
 
+	// Bound a blocked recv so Close can wait for in-flight syscalls before
+	// releasing descriptors. Linux close alone does not interrupt Recvfrom.
+	if err := syscall.SetsockoptTimeval(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO,
+		&syscall.Timeval{Usec: 250000}); err != nil {
+		syscall.Close(sendFd)
+		syscall.Close(recvFd)
+		return nil, fmt.Errorf("l3: receive timeout: %w", err)
+	}
 	b := &rawBackend{
 		sendFd: sendFd,
 		recvFd: recvFd,
@@ -61,6 +70,16 @@ func newBackend() (L3Backend, error) {
 func (b *rawBackend) EgressIP() [4]byte { return b.egress }
 
 func (b *rawBackend) Send(pkt []byte) error {
+	b.ioMu.RLock()
+	defer b.ioMu.RUnlock()
+	select {
+	case <-b.closed:
+		return net.ErrClosed
+	default:
+	}
+	if len(pkt) < 20 {
+		return fmt.Errorf("l3: short IPv4 packet")
+	}
 	var dst [4]byte
 	copy(dst[:], pkt[16:20])
 	addr := &syscall.SockaddrInet4{Addr: dst}
@@ -76,7 +95,15 @@ func (b *rawBackend) Recv(cb func([]byte)) {
 				return
 			default:
 			}
+			b.ioMu.RLock()
+			select {
+			case <-b.closed:
+				b.ioMu.RUnlock()
+				return
+			default:
+			}
 			n, _, err := syscall.Recvfrom(b.recvFd, buf, 0)
+			b.ioMu.RUnlock()
 			if err != nil {
 				if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 					continue
@@ -106,6 +133,8 @@ func (b *rawBackend) Recv(cb func([]byte)) {
 func (b *rawBackend) Close() error {
 	b.closeOnce.Do(func() {
 		close(b.closed)
+		b.ioMu.Lock()
+		defer b.ioMu.Unlock()
 		syscall.Close(b.sendFd)
 		syscall.Close(b.recvFd)
 	})

@@ -60,6 +60,9 @@ type DocSession struct {
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.Conn.SetWriteDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		return err
+	}
 	return s.Conn.WriteMessage(messageType, data)
 }
 
@@ -277,16 +280,18 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		// races the server's own handshake frame; strict balancers then close
 		// the socket with 1005 within ~50-100ms and no frames. Reading OPEN
 		// first makes the handshake deterministic (confirmed live upstream).
+		stopClose := context.AfterFunc(ctx, func() { conn.Close() })
+		defer stopClose()
 		conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-		if _, first, err := conn.ReadMessage(); err != nil {
-			utils.Debugf("[YDOCS] read engine.io OPEN failed: %v", err)
+		_, first, err := conn.ReadMessage()
+		readTimeout, openErr := engineReadTimeout(first)
+		if err != nil || openErr != nil {
+			utils.Debugf("[YDOCS] invalid engine.io OPEN: read=%v parse=%v", err, openErr)
 			conn.Close()
 			t.scheduleReconnect(attempt)
 			return
-		} else if len(first) == 0 || first[0] != '0' {
-			utils.Debugf("[YDOCS] unexpected first frame (want engine.io OPEN \"0...\"): %q", first)
 		}
-		conn.SetReadDeadline(time.Time{})
+		conn.SetReadDeadline(time.Now().Add(readTimeout))
 
 		writeQueue := make(chan []byte, t.GetConfig().MaxQueueSize)
 		if existingSession != nil {
@@ -346,10 +351,30 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 				t.scheduleReconnect(next)
 				return
 			}
+			conn.SetReadDeadline(time.Now().Add(readTimeout))
 			t.handleMessage(session, message)
 		}
 		conn.Close()
 	})
+}
+
+// Engine.IO advertises heartbeat times in milliseconds. Bound untrusted
+// values before converting to Duration; tolerate older servers without them.
+func engineReadTimeout(open []byte) (time.Duration, error) {
+	var timing struct {
+		PingInterval int64 `json:"pingInterval"`
+		PingTimeout  int64 `json:"pingTimeout"`
+	}
+	if len(open) < 2 || open[0] != '0' {
+		return 0, fmt.Errorf("expected OPEN")
+	}
+	if err := json.Unmarshal(open[1:], &timing); err != nil {
+		return 0, err
+	}
+	if timing.PingInterval <= 0 || timing.PingTimeout <= 0 || timing.PingInterval > 300000 || timing.PingTimeout > 300000 {
+		return 45 * time.Second, nil
+	}
+	return time.Duration(timing.PingInterval+timing.PingTimeout) * time.Millisecond, nil
 }
 
 func (t *YandexDocsTransport) writerLoop() {
@@ -390,7 +415,7 @@ func (t *YandexDocsTransport) writerLoop() {
 		t.Mu.RLock()
 		session := t.session
 		t.Mu.RUnlock()
-		if session == nil || session.Conn == nil {
+		if session == nil || session.Conn == nil || !t.IsConnected() {
 			// Mid-reconnect: hold the packet and retry rather than drop it.
 			if !sleepCtx(ctx, 15*time.Millisecond) {
 				return
@@ -402,6 +427,7 @@ func (t *YandexDocsTransport) writerLoop() {
 		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
 		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
 			utils.Debugf("[YDOCS] Write error: %v", err)
+			session.Conn.Close()
 			if !sleepCtx(ctx, 15*time.Millisecond) {
 				return
 			}
@@ -468,6 +494,12 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 
 func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
+	if text == "1" || text == "41" || strings.HasPrefix(text, "44") {
+		if session != nil && session.Conn != nil {
+			session.Conn.Close()
+		}
+		return
+	}
 
 	if strings.Contains(text, keepAliveMarker) || strings.Contains(text, "__KA__") {
 		// The server never echoes our own cursor messages back, so this is

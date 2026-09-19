@@ -55,6 +55,7 @@ type BaseTransport struct {
 	connected atomic.Int32
 	stats     TransportStats
 	startTime time.Time
+	startMu   sync.RWMutex
 
 	receiveCallback func([]byte)
 	Mu              sync.RWMutex
@@ -71,8 +72,10 @@ func NewBaseTransport(config TransportConfig) *BaseTransport {
 }
 
 func (b *BaseTransport) Start() error {
-	b.running.Store(1)
+	b.startMu.Lock()
 	b.startTime = time.Now()
+	b.startMu.Unlock()
+	b.running.Store(1)
 	return nil
 }
 
@@ -120,6 +123,9 @@ func (b *BaseTransport) GetSession(accessor func(interface{})) {
 }
 
 func (b *BaseTransport) Stats() TransportStats {
+	b.startMu.RLock()
+	startTime := b.startTime
+	b.startMu.RUnlock()
 	return TransportStats{
 		BytesSent:     atomic.LoadUint64(&b.stats.BytesSent),
 		BytesReceived: atomic.LoadUint64(&b.stats.BytesReceived),
@@ -127,7 +133,7 @@ func (b *BaseTransport) Stats() TransportStats {
 		PacketsRecv:   atomic.LoadUint64(&b.stats.PacketsRecv),
 		Reconnects:    uint64(b.reconnectAttempts.Load()),
 		Connected:     b.IsConnected(),
-		Uptime:        time.Since(b.startTime),
+		Uptime:        time.Since(startTime),
 		LastRecv:      b.LastRecv(),
 	}
 }
@@ -167,7 +173,6 @@ func (b *BaseTransport) ForgetPeer() {
 func (b *BaseTransport) RecordReconnect() {
 	b.reconnectAttempts.Add(1)
 }
-
 
 func (b *BaseTransport) GetConfig() TransportConfig {
 	return b.config

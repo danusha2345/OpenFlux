@@ -214,3 +214,33 @@ func TestVolgaFailedRefreshBackoff(t *testing.T) {
 		t.Fatal("backoff did not allow a later retry")
 	}
 }
+
+func TestVolgaStopDuringInitialAuthorization(t *testing.T) {
+	entered := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	tr := NewYandexVolgaTransport(server.URL, transport.DefaultConfig())
+	started := make(chan error, 1)
+	go func() { started <- tr.Start() }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("authorization did not start")
+	}
+	stopped := make(chan struct{})
+	go func() { tr.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("Stop waited for authorization timeout")
+	}
+	if err := <-started; err == nil {
+		t.Fatal("cancelled Start succeeded")
+	}
+	if tr.IsRunning() || tr.IsConnected() {
+		t.Fatal("cancelled transport remained active")
+	}
+}

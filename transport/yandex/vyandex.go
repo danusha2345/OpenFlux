@@ -1120,9 +1120,11 @@ func decodeBatch(decoded []byte) [][]byte {
 }
 
 type YandexVolgaTransport struct {
-	lifecycleMu sync.Mutex
-	stateMu     sync.RWMutex
-	background  sync.WaitGroup
+	lifecycleMu   sync.Mutex
+	startupDone   chan struct{}
+	startupCancel context.CancelFunc
+	stateMu       sync.RWMutex
+	background    sync.WaitGroup
 	*transport.BaseTransport
 
 	docURL string
@@ -1151,18 +1153,29 @@ func NewYandexVolgaTransport(docURL string, cfg transport.TransportConfig) *Yand
 
 func (t *YandexVolgaTransport) Start() error {
 	t.lifecycleMu.Lock()
-	defer t.lifecycleMu.Unlock()
 	if t.IsRunning() {
+		t.lifecycleMu.Unlock()
 		return fmt.Errorf("transport already running")
 	}
 	if err := t.BaseTransport.Start(); err != nil {
+		t.lifecycleMu.Unlock()
 		return err
 	}
 
 	utils.Debugf("[VOLGA] authorizing...")
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	done := make(chan struct{})
+	t.startupDone, t.startupCancel = done, cancel
+	t.lifecycleMu.Unlock()
 	auth, err := authorize(ctx, t.docURL)
+	t.lifecycleMu.Lock()
+	defer t.lifecycleMu.Unlock()
+	defer close(done)
+	t.startupDone, t.startupCancel = nil, nil
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
 	if err != nil {
 		t.BaseTransport.Stop()
 		return fmt.Errorf("auth: %w", err)
@@ -1198,7 +1211,16 @@ func (t *YandexVolgaTransport) Start() error {
 }
 
 func (t *YandexVolgaTransport) Stop() error {
-	t.lifecycleMu.Lock()
+	for {
+		t.lifecycleMu.Lock()
+		if done := t.startupDone; done != nil {
+			t.startupCancel()
+			t.lifecycleMu.Unlock()
+			<-done
+			continue
+		}
+		break
+	}
 	defer t.lifecycleMu.Unlock()
 	select {
 	case <-t.keepAliveStop:

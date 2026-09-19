@@ -2,6 +2,7 @@ package yandex
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -410,19 +411,36 @@ func (t *YandexDocsTransport) writerLoop() {
 	}
 }
 
-// keepAliveFrame is a cursor message the peer recognizes and drops; it keeps
-// the session warm and tells the peer this document reaches us.
-const keepAliveFrame = `42["message",{"type":"cursor","cursor":"18;---KA---"}]`
+// keepAliveMarker is kept wire-compatible with older peers. Padding and timing
+// vary so keepalives do not have a fixed TLS-record size and cadence.
+const keepAliveMarker = "---KA---"
+
+func makeKeepAliveFrame() []byte {
+	padding := make([]byte, 4+rand.Intn(48))
+	if _, err := crand.Read(padding); err != nil {
+		// A keepalive does not need cryptographic randomness. math/rand is an
+		// acceptable fallback when the OS RNG is temporarily unavailable.
+		_, _ = rand.Read(padding)
+	}
+	encoded := base64.StdEncoding.EncodeToString(padding)
+	return []byte(fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s%s"}]`,
+		keepAliveMarker, encoded))
+}
 
 func (t *YandexDocsTransport) keepAliveLoop() {
-	ticker := time.NewTicker(t.GetConfig().KeepAliveInterval)
-	defer ticker.Stop()
-
 	ctx := t.runCtx()
 	for t.IsRunning() {
+		base := t.GetConfig().KeepAliveInterval
+		if base <= 0 {
+			base = 10 * time.Second
+		}
+		// 0.5x..1.5x, while remaining interruptible by Stop().
+		delay := base/2 + time.Duration(rand.Int63n(int64(base)))
+		timer := time.NewTimer(delay)
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 		case <-ctx.Done():
+			timer.Stop()
 			return
 		}
 		t.Mu.Lock()
@@ -430,7 +448,7 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 		t.Mu.Unlock()
 
 		if session != nil && session.Conn != nil {
-			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveFrame)); err != nil {
+			if err := session.safeWrite(websocket.TextMessage, makeKeepAliveFrame()); err != nil {
 				utils.Debugf("[YDOCS] Keep-alive failed: %v", err)
 				// A failed write leaves the conn unusable for writes while
 				// reads may still block for a long time. Close it so the read
@@ -451,7 +469,7 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
 
-	if strings.Contains(text, "---KA---") {
+	if strings.Contains(text, keepAliveMarker) || strings.Contains(text, "__KA__") {
 		// The server never echoes our own cursor messages back, so this is
 		// the peer's keepalive: proof that this document reaches it.
 		t.RecordPeerActivity()
@@ -542,7 +560,7 @@ func (t *YandexDocsTransport) handleParticipants(session *DocSession, text strin
 		if p.ConnectionID != session.connID {
 			// Someone else is here, possibly the peer that just (re)joined:
 			// greet it so it hears us without waiting for our next tick.
-			session.safeWrite(websocket.TextMessage, []byte(keepAliveFrame))
+			session.safeWrite(websocket.TextMessage, makeKeepAliveFrame())
 			return
 		}
 	}

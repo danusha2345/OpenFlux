@@ -48,6 +48,8 @@
 >
 > **Android-приложение** - [p1neappleXpress/OpenFluxAndroid](https://github.com/p1neappleXpress/OpenFluxAndroid).
 
+Практическая настройка и проверка Яндекса: [руководство](docs/YANDEX-OPERATIONS.ru.md).
+
 ## Архитектура
 
 > **Шифрование включено по умолчанию** (Noise `NKpsk0`): запускайте выходную

@@ -121,7 +121,7 @@ struct ContentView: View {
                         Label("Start", systemImage: "play.fill").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!canStart || vpn.active)
+                    .disabled(!canStart || vpn.active || tunnel.busy)
                 }
                 Button { tunnel.testThroughProxy() } label: {
                     Label("Test", systemImage: "network").frame(maxWidth: .infinity)

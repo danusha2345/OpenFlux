@@ -290,24 +290,28 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 //
 //export OpenFluxStop
 func OpenFluxStop() {
+	// Snapshot and clear state under the lock, then stop outside it: a
+	// transport Stop can take seconds, and the app polls OpenFluxIsRunning /
+	// OpenFluxStatsJSON from its main thread.
 	stateMu.Lock()
-	defer stateMu.Unlock()
 	if !running {
+		stateMu.Unlock()
 		return
 	}
-	if socks != nil {
-		socks.Close()
-	}
-	if trans != nil {
-		trans.Stop()
-	}
-	if clientTunnel != nil {
-		clientTunnel.Close()
-	}
-	socks = nil
-	trans = nil
-	clientTunnel = nil
+	s, t, tun := socks, trans, clientTunnel
+	socks, trans, clientTunnel = nil, nil, nil
 	running = false
+	stateMu.Unlock()
+
+	if s != nil {
+		s.Close()
+	}
+	if t != nil {
+		t.Stop()
+	}
+	if tun != nil {
+		tun.Close()
+	}
 	utils.Debugf("[BRIDGE] Stopped")
 }
 

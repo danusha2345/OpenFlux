@@ -32,60 +32,78 @@ final class TunnelController: ObservableObject {
     /// Local SOCKS5 listen address for the currently running session.
     private(set) var socksAddr = ""
 
+    @Published var busy = false
+
     /// Starts the client tunnel over the selected transport.
     /// - port: local SOCKS5 port to listen on (127.0.0.1:port).
+    /// The Go start call blocks until the transport is up (document auth can
+    /// take many seconds), so it runs off the main actor to keep the UI alive.
     func start(transport: TransportKind, url: String, maxToken: String, maxUid: String,
                peerKey: String, port: Int) {
-        guard !running else { return }
-        OpenFluxSetAllowPlaintext(0)
-        peerKey.withCString { key in
-            OpenFluxSetPeerKey(UnsafeMutablePointer(mutating: key))
-        }
+        guard !running, !busy else { return }
+        busy = true
         let addr = "127.0.0.1:\(port)"
         socksAddr = addr
-
-        let rc = transport.rawValue.withCString { tt in
-            url.withCString { u in
-                addr.withCString { a in
-                    maxToken.withCString { tok in
-                        maxUid.withCString { uid in
-                            OpenFluxStartClient(
-                                UnsafeMutablePointer(mutating: tt),
-                                UnsafeMutablePointer(mutating: u),
-                                UnsafeMutablePointer(mutating: a),
-                                UnsafeMutablePointer(mutating: tok),
-                                UnsafeMutablePointer(mutating: uid)
-                            )
+        let tt = transport.rawValue
+        Task.detached {
+            OpenFluxSetAllowPlaintext(0)
+            peerKey.withCString { key in
+                OpenFluxSetPeerKey(UnsafeMutablePointer(mutating: key))
+            }
+            let rc = tt.withCString { t in
+                url.withCString { u in
+                    addr.withCString { a in
+                        maxToken.withCString { tok in
+                            maxUid.withCString { uid in
+                                OpenFluxStartClient(
+                                    UnsafeMutablePointer(mutating: t),
+                                    UnsafeMutablePointer(mutating: u),
+                                    UnsafeMutablePointer(mutating: a),
+                                    UnsafeMutablePointer(mutating: tok),
+                                    UnsafeMutablePointer(mutating: uid)
+                                )
+                            }
                         }
                     }
                 }
             }
+            await MainActor.run {
+                self.appendLog(Self.describe(rc: rc, addr: addr, port: port, transport: transport))
+                self.busy = false
+                self.running = OpenFluxIsRunning() != 0
+                if self.running { self.startPolling() } else { self.pollOnce() }
+            }
         }
+    }
 
+    private static func describe(rc: Int32, addr: String, port: Int, transport: TransportKind) -> String {
         switch rc {
-        case 0:
-            appendLog("[app] started on \(addr) via \(transport.title)")
-        case 1:
-            appendLog("[app] already running")
-        case 2:
-            appendLog("[app] unknown transport")
-        case 3:
-            appendLog("[app] transport failed to start")
-        case 4:
-            appendLog("[app] port \(port) is busy — pick another port")
-        default:
-            appendLog("[app] start failed (code \(rc))")
+        case 0: return "[app] started on \(addr) via \(transport.title)"
+        case 1: return "[app] already running"
+        case 2: return "[app] unknown transport"
+        case 3: return "[app] transport failed to start (check URL / network)"
+        case 4: return "[app] port \(port) is busy — pick another port"
+        case 5: return "[app] internal error (see log)"
+        case 6: return "[app] tunnel init failed"
+        case 7: return "[app] bad exit public key — copy it from the exit node banner"
+        default: return "[app] start failed (code \(rc))"
         }
-
-        running = OpenFluxIsRunning() != 0
-        startPolling()
     }
 
     func stop() {
-        OpenFluxStop()
-        running = false
-        connected = false
-        pollOnce()
+        guard !busy else { return }
+        busy = true
+        timer?.invalidate()
+        timer = nil
+        Task.detached {
+            OpenFluxStop()
+            await MainActor.run {
+                self.busy = false
+                self.running = false
+                self.connected = false
+                self.pollOnce()
+            }
+        }
     }
 
     private func startPolling() {

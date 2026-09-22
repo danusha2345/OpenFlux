@@ -753,21 +753,12 @@ func (r *relayClient) sendBatchAttempt(batch [][]byte, retry bool) error {
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.ContentLength = int64(len(bodyCopy))
 
-	var cookieParts []string
-	for _, c := range auth.Cookies {
-		cookieParts = append(cookieParts, c.Name+"="+c.Value)
-	}
-	if len(cookieParts) > 0 {
-		req.Header.Set("Cookie", strings.Join(cookieParts, "; "))
-	}
-
 	// Copy the immutable client settings; each request uses its auth snapshot's
 	// jar. Never mutate a shared http.Client while workers call Do.
 	client := *r.httpClient
 	if auth.Session != nil {
 		client.Jar = auth.Session.Jar
 	}
-	req.Header.Del("Cookie")
 	if client.Jar == nil {
 		for _, cookie := range auth.Cookies {
 			req.AddCookie(cookie)
@@ -892,7 +883,9 @@ func (w *wsListener) run() {
 		connStart := time.Now()
 		if err := w.connect(); err != nil && w.ctx.Err() == nil {
 			utils.Debugf("[VOLGA] WS error: %v", err)
-			if w.relay != nil {
+			// A session that stayed up was a routine drop, not rejected
+			// credentials; re-authorize only when the connect itself fails.
+			if w.relay != nil && time.Since(connStart) < 30*time.Second {
 				if err := w.relay.refreshAuth(rejected); err != nil {
 					utils.Debugf("[VOLGA] re-authorize failed: %v", err)
 				}

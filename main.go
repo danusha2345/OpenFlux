@@ -399,10 +399,12 @@ DEPRECATED (removed in v2)
 		if *benchBytes <= 0 {
 			log.Fatalf("--role=bench-send requires --bench-bytes=<MB>")
 		}
+		startTrafficStats(trans)
 		runBenchSend(trans, *benchBytes, *benchCompressible)
 		return
 	}
 	if *role == roleBenchSink {
+		startTrafficStats(trans)
 		runBenchSink(trans)
 		return
 	}
@@ -509,16 +511,22 @@ func startTransport(trans transport.Transport) {
 	if err := trans.Start(); err != nil {
 		log.Fatalf("Failed to start transport: %v", err)
 	}
-	if trafficEvery > 0 {
-		go func() {
-			ticker := time.NewTicker(trafficEvery)
-			defer ticker.Stop()
-			for range ticker.C {
-				s := trans.Stats()
-				log.Printf("[TRAFFIC] connected=%t tx=%d rx=%d", s.Connected, s.BytesSent, s.BytesReceived)
-			}
-		}()
+	startTrafficStats(trans)
+}
+
+// startTrafficStats emits --traffic-stats lines for any role.
+func startTrafficStats(trans transport.Transport) {
+	if trafficEvery <= 0 {
+		return
 	}
+	go func() {
+		ticker := time.NewTicker(trafficEvery)
+		defer ticker.Stop()
+		for range ticker.C {
+			s := trans.Stats()
+			log.Printf("[TRAFFIC] connected=%t tx=%d rx=%d", s.Connected, s.BytesSent, s.BytesReceived)
+		}
+	}()
 }
 
 func runClient(trans transport.Transport, inbound, socksAddr string, exitMode tunnel.ExitMode) {

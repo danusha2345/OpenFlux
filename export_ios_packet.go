@@ -209,8 +209,12 @@ var dnsSem = make(chan struct{}, 16)
 // OpenFluxTunReadPacket blocks for the next packet destined to the device.
 //
 //export OpenFluxTunReadPacket
-func OpenFluxTunReadPacket(buf *C.char, max C.int) C.int {
-	defer func() { _ = recover() }()
+func OpenFluxTunReadPacket(buf *C.char, max C.int) (rc C.int) {
+	defer func() {
+		if recover() != nil {
+			rc = -1 // stop the Swift loop instead of spinning on 0
+		}
+	}()
 	if buf == nil || max <= 0 {
 		return -1
 	}

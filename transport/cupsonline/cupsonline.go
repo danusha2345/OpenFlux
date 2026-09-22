@@ -151,7 +151,12 @@ func authorize(roomURL string) (*cupsAuth, error) {
 		httpClient: client,
 	}
 	if a.roomUUID != "" && !strings.Contains(a.roomURL, "room=") {
-		a.roomURL = fmt.Sprintf("%s?room=%s", strings.TrimRight(roomURL, "/"), a.roomUUID)
+		if u, err := url.Parse(roomURL); err == nil {
+			q := u.Query()
+			q.Set("room", a.roomUUID)
+			u.RawQuery = q.Encode()
+			a.roomURL = u.String()
+		}
 	}
 	for _, c := range jar.Cookies(mustParseURL(roomURL)) {
 		if c.Name == "csrftoken" {
@@ -355,7 +360,7 @@ func (w *cupsWS) run() {
 			utils.Debugf("[CUPS] ws error (%s): %v", roomUUID, err)
 			// При ошибке подключения (например, если протух токен сессии/JWT или заблокирована комната)
 			// заново выполняем авторизацию комнаты для получения свежих токенов и cookies.
-			if auth != nil && auth.roomURL != "" {
+			if auth != nil && auth.roomURL != "" && !w.closed.Load() {
 				if newAuth, authErr := authorize(auth.roomURL); authErr == nil {
 					w.updateAuth(newAuth)
 					utils.Debugf("[CUPS] re-authorize OK: room=%s", newAuth.roomUUID)

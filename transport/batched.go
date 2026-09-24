@@ -75,9 +75,18 @@ func envInt(name string, def int) int {
 }
 
 func NewBatchedTransport(inner Transport) *BatchedTransport {
+	return NewBatchedTransportWithQueueDepth(inner, batchQueueDepth)
+}
+
+// NewBatchedTransportWithQueueDepth bounds the number of waiting packets for
+// memory-constrained clients. The default constructor preserves CLI behavior.
+func NewBatchedTransportWithQueueDepth(inner Transport, queueDepth int) *BatchedTransport {
+	if queueDepth < 1 {
+		queueDepth = 1
+	}
 	return &BatchedTransport{
 		Transport:     inner,
-		queue:         make(chan []byte, batchQueueDepth),
+		queue:         make(chan []byte, queueDepth),
 		stop:          make(chan struct{}),
 		lingerMs:      envInt("OPENFLUX_BATCH_LINGER_MS", defaultLingerMs),
 		maxBatchBytes: envInt("OPENFLUX_BATCH_BYTES", defaultMaxBatchBytes),

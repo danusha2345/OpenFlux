@@ -1,7 +1,7 @@
 # OpenFlux iOS app
 
-SwiftUI client that links the OpenFlux Go core (`liboflux.a`) and runs the
-SOCKS5 tunnel over the Yandex.Docs transport on `127.0.0.1:1080`.
+SwiftUI client that links the OpenFlux Go core (`liboflux.a`). It offers a
+local SOCKS5 proxy and a system VPN through `NEPacketTunnelProvider`.
 
 ## Layout
 - `project.yml` — XcodeGen project definition (run `xcodegen generate` to produce `OpenFlux.xcodeproj`).
@@ -39,9 +39,22 @@ Produces `ios-app/build/export/OpenFlux.ipa`, distribution-signed for the App St
 3. The build appears in TestFlight after Apple processing (a few minutes).
 
 ## Notes / follow-ups
-- The app runs a **local** SOCKS5 proxy. The in-app **Test** button proves the
-  tunnel carries traffic (fetches the exit IP through the proxy). Routing the
-  whole device requires a Network Extension (`NEPacketTunnelProvider`) target
-  with the Network Extensions capability — not included in this first build.
 - Deployment target: iOS 15.0 (SwiftUI App lifecycle). The Go lib is built with
   `-miphoneos-version-min=13.0`, so it is compatible.
+
+## Хранение настроек и VPN
+
+- URL подключения, данные MAX и публичный ключ Noise находятся в общей группе
+  Keychain приложения и расширения. При первом запуске после обновления
+  приложение переносит данные из UserDefaults и старого VPN-профиля; старые
+  копии удаляются только после успешного сохранения. После перезагрузки iPhone
+  нужно хотя бы раз разблокировать устройство для доступа к этим данным.
+- До установки маршрута по умолчанию расширение определяет IPv4-адреса
+  служебных узлов транспорта и DoT и исключает их из VPN. Для Яндекса также
+  используются его диапазоны из маршрутного плана. На остальных транспортах
+  адрес нового динамического relay может потребовать отдельной проверки.
+- После первой подтверждённой связи расширение выставляет `reasserting` при
+  потере транспорта, сохраняя циклы обработки пакетов.
+- Подписанная сборка на iPhone должна проверить доступ обоих target к Keychain,
+  миграцию, сон и переподключение при смене Wi-Fi/сотовой сети. Локальные
+  Go-проверки не компилируют Swift.

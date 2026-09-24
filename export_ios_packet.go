@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"io"
 	"net"
 	"runtime/debug"
@@ -39,6 +40,24 @@ import (
 // Uses startOK / start* codes and dotServers from export_ios.go.
 
 const tunClientIP = "10.10.10.2"
+
+// OpenFluxResolveBypassRoutes resolves carrier/DoT IPv4 routes before the
+// default VPN route is installed. The caller frees the JSON with
+// OpenFluxFreeString. A nil result means startup must stop.
+//
+//export OpenFluxResolveBypassRoutes
+func OpenFluxResolveBypassRoutes(transportType, url *C.char) *C.char {
+	routes, err := resolveMobileBypassRoutes(C.GoString(transportType), C.GoString(url))
+	if err != nil {
+		utils.Debugf("[PKT] carrier route bootstrap failed: %v", err)
+		return nil
+	}
+	data, err := json.Marshal(routes)
+	if err != nil {
+		return nil
+	}
+	return C.CString(string(data))
+}
 
 var (
 	ptMu     sync.Mutex
@@ -80,6 +99,7 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	}
 
 	config := transport.DefaultConfig()
+	config.MaxQueueSize = 128
 	var t transport.Transport
 	switch tt {
 	case "yandex", "", "vyandex":
@@ -99,7 +119,7 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 		return C.int(startBadEncryption)
 	}
 
-	outQ := make(chan []byte, 1024)
+	outQ := make(chan []byte, 128)
 	// Packets coming back from the exit node -> queue for the device.
 	t.Receive(func(data []byte) {
 		select {
@@ -119,6 +139,20 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	ptOn = true
 	utils.Debugf("[PKT] L3 packet tunnel started (transport %s)", tt)
 	return C.int(startOK)
+}
+
+// OpenFluxPacketTunnelIsConnected reports the authenticated transport state to
+// NetworkExtension. A transient carrier disconnect does not stop the tunnel.
+//
+//export OpenFluxPacketTunnelIsConnected
+func OpenFluxPacketTunnelIsConnected() C.int {
+	ptMu.Lock()
+	t := ptTrans
+	ptMu.Unlock()
+	if t != nil && t.IsConnected() {
+		return 1
+	}
+	return 0
 }
 
 // OpenFluxTunWritePacket forwards one device IPv4 packet: TCP goes over the

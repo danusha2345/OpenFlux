@@ -17,6 +17,7 @@ targets:
     platform: iOS
     sources:
       - path: OpenFlux
+      - path: Shared
       - path: Lib
         buildPhase: none
     dependencies:
@@ -40,6 +41,8 @@ targets:
       properties:
         com.apple.developer.networking.networkextension:
           - packet-tunnel-provider
+        keychain-access-groups:
+          - "$(AppIdentifierPrefix)com.p1neapplexpress-saharev.openflux"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.p1neapplexpress-saharev.openflux
@@ -67,6 +70,7 @@ targets:
     platform: iOS
     sources:
       - path: OpenFluxTunnel
+      - path: Shared
       - path: Lib
         buildPhase: none
     dependencies:
@@ -86,6 +90,8 @@ targets:
       properties:
         com.apple.developer.networking.networkextension:
           - packet-tunnel-provider
+        keychain-access-groups:
+          - "$(AppIdentifierPrefix)com.p1neapplexpress-saharev.openflux"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.p1neapplexpress-saharev.openflux.tunnel

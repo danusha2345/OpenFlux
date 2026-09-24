@@ -406,6 +406,8 @@ Start clients with --peer-key=<ключ в base64>
 # Cups.online (Centrifugo-комнаты)
 ./openflux --role=exit --mode=l3 --transport=cupsonline --debug
 # печатает base64-список комнат; передайте его клиенту через --url
+# После перехода Cups.online на числовые row/column прежний строковый канал
+# несовместим: обновите одновременно клиент и выходную ноду.
 
 # Mail.ru Docs (WS)
 ./openflux --role=exit --mode=l3 --transport=mailru \

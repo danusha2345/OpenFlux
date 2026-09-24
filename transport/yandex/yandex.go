@@ -13,6 +13,7 @@ import (
 	"net/http"
 	neturl "net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -244,6 +245,24 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			t.scheduleReconnect(attempt)
 			return
 		}
+		wsURL := info.WsURL
+		wsCookies := info.CookieStr
+		readTimeout := 45 * time.Second
+		polled := false
+		if sid, cookies, timeout, pollErr := t.engineIOPoll(ctx, info); pollErr == nil {
+			u, err := neturl.Parse(info.WsURL)
+			if err != nil {
+				utils.Debugf("[YDOCS] invalid websocket URL: %v", err)
+				t.scheduleReconnect(attempt)
+				return
+			}
+			q := u.Query()
+			q.Set("sid", sid)
+			u.RawQuery = q.Encode()
+			wsURL, wsCookies, readTimeout, polled = u.String(), cookies, timeout, true
+		} else {
+			utils.Debugf("[YDOCS] engine.io polling unavailable; trying direct websocket")
+		}
 
 		// Hard TCP dial timeout so a stuck connect/DNS to the balancer host
 		// can't hang the whole transport (HandshakeTimeout alone proved
@@ -259,11 +278,11 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		headers := http.Header{}
 		headers.Set("User-Agent", "Mozilla/5.0")
 		headers.Set("Origin", info.Origin)
-		headers.Set("Cookie", info.CookieStr)
+		headers.Set("Cookie", wsCookies)
 		headers.Set("Host", info.Host)
 
-		utils.Debugf("[YDOCS] WebSocket dial %s", maskURL(info.WsURL))
-		conn, resp, err := dialer.DialContext(ctx, info.WsURL, headers)
+		utils.Debugf("[YDOCS] WebSocket dial %s", maskURL(wsURL))
+		conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
 		if err != nil {
 			status := 0
 			if resp != nil {
@@ -275,21 +294,30 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		}
 		utils.Debugf("[YDOCS] WebSocket connected to %s", info.Host)
 
-		// Wait for the server's engine.io OPEN packet ("0{...sid...}") before
-		// writing anything. Sending socket.io 40/42 right after the upgrade
-		// races the server's own handshake frame; strict balancers then close
-		// the socket with 1005 within ~50-100ms and no frames. Reading OPEN
-		// first makes the handshake deterministic (confirmed live upstream).
 		stopClose := context.AfterFunc(ctx, func() { conn.Close() })
 		defer stopClose()
-		conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-		_, first, err := conn.ReadMessage()
-		readTimeout, openErr := engineReadTimeout(first)
-		if err != nil || openErr != nil {
-			utils.Debugf("[YDOCS] invalid engine.io OPEN: read=%v parse=%v", err, openErr)
-			conn.Close()
-			t.scheduleReconnect(attempt)
-			return
+		if polled {
+			if err := engineIOProbe(conn); err != nil {
+				utils.Debugf("[YDOCS] engine.io upgrade failed: %v", err)
+				conn.Close()
+				t.scheduleReconnect(attempt)
+				return
+			}
+		} else {
+			// Direct websocket is accepted by some balancers. Wait for OPEN
+			// before sending any socket.io frame on that path.
+			conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+			_, first, err := conn.ReadMessage()
+			var openErr error
+			if err == nil {
+				readTimeout, openErr = engineReadTimeout(first)
+			}
+			if err != nil || openErr != nil {
+				utils.Debugf("[YDOCS] invalid engine.io OPEN: read=%v parse=%v", err, openErr)
+				conn.Close()
+				t.scheduleReconnect(attempt)
+				return
+			}
 		}
 		conn.SetReadDeadline(time.Now().Add(readTimeout))
 
@@ -375,6 +403,124 @@ func engineReadTimeout(open []byte) (time.Duration, error) {
 		return 45 * time.Second, nil
 	}
 	return time.Duration(timing.PingInterval+timing.PingTimeout) * time.Millisecond, nil
+}
+
+// engineIOPoll obtains a session id for balancers that require the standard
+// Engine.IO polling-to-websocket upgrade. A caller may keep the direct path
+// when polling is unavailable, since older balancers accept websocket first.
+func (t *YandexDocsTransport) engineIOPoll(ctx context.Context, info YandexDocsInfo) (string, string, time.Duration, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	u, err := neturl.Parse(info.WsURL)
+	if err != nil || u.Scheme != "wss" {
+		return "", "", 0, fmt.Errorf("invalid websocket URL")
+	}
+	u.Scheme = "https"
+	q := u.Query()
+	q.Set("transport", "polling")
+	u.RawQuery = q.Encode()
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if t.tlsConfig != nil {
+		tr.TLSClientConfig = t.tlsConfig
+	}
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", "", 0, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("Origin", info.Origin)
+	req.Header.Set("Cookie", info.CookieStr)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", 0, fmt.Errorf("polling status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10+1))
+	if err != nil || len(data) > 64<<10 {
+		return "", "", 0, fmt.Errorf("polling response too large or unreadable: %v", err)
+	}
+	if i := strings.IndexByte(string(data), 0x1e); i >= 0 {
+		data = data[:i]
+	}
+	var open struct {
+		SID      string   `json:"sid"`
+		Upgrades []string `json:"upgrades"`
+	}
+	if len(data) < 2 || data[0] != '0' || json.Unmarshal(data[1:], &open) != nil || open.SID == "" {
+		return "", "", 0, fmt.Errorf("invalid engine.io polling OPEN")
+	}
+	upgradeOK := false
+	for _, name := range open.Upgrades {
+		upgradeOK = upgradeOK || name == "websocket"
+	}
+	if !upgradeOK {
+		return "", "", 0, fmt.Errorf("websocket upgrade unavailable")
+	}
+	readTimeout, err := engineReadTimeout(data)
+	if err != nil {
+		return "", "", 0, err
+	}
+	return open.SID, mergeCookies(info.CookieStr, resp.Cookies()), readTimeout, nil
+}
+
+func mergeCookies(base string, updated []*http.Cookie) string {
+	values := make(map[string]string)
+	for _, part := range strings.Split(base, ";") {
+		name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && name != "" {
+			values[name] = value
+		}
+	}
+	for _, cookie := range updated {
+		values[cookie.Name] = cookie.Value
+	}
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, name+"="+values[name])
+	}
+	return strings.Join(parts, "; ")
+}
+
+func engineIOProbe(conn *websocket.Conn) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		return err
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, []byte("2probe")); err != nil {
+		return err
+	}
+	for i := 0; i < 5; i++ {
+		if err := conn.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
+			return err
+		}
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+		switch string(msg) {
+		case "3probe":
+			if err := conn.SetWriteDeadline(time.Now().Add(15 * time.Second)); err != nil {
+				return err
+			}
+			return conn.WriteMessage(websocket.TextMessage, []byte("5"))
+		case "2":
+			if err := conn.WriteMessage(websocket.TextMessage, []byte("3")); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unexpected engine.io probe response")
+		}
+	}
+	return fmt.Errorf("engine.io probe response not received")
 }
 
 func (t *YandexDocsTransport) writerLoop() {

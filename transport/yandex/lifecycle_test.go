@@ -22,9 +22,10 @@ import (
 type fakeDocServer struct {
 	pageURL string
 
-	mu    sync.Mutex
-	conns []*websocket.Conn
-	recv  []string
+	mu      sync.Mutex
+	writeMu sync.Mutex
+	conns   []*websocket.Conn
+	recv    []string
 }
 
 func newFakeDocServer(t *testing.T) *fakeDocServer {
@@ -46,8 +47,9 @@ func newFakeDocServerWithOpen(t *testing.T, open string) *fakeDocServer {
 		f.mu.Unlock()
 		// Real servers send the engine.io OPEN frame first; the transport now
 		// waits for it before authenticating.
-		_ = conn.WriteMessage(websocket.TextMessage,
-			[]byte(open))
+		f.writeMu.Lock()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(open))
+		f.writeMu.Unlock()
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
@@ -78,7 +80,10 @@ func (f *fakeDocServer) push(t *testing.T, msg string) {
 	f.mu.Lock()
 	conn := f.conns[len(f.conns)-1]
 	f.mu.Unlock()
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(msg)); err != nil {
+	f.writeMu.Lock()
+	err := conn.WriteMessage(websocket.TextMessage, []byte(msg))
+	f.writeMu.Unlock()
+	if err != nil {
 		t.Fatalf("server push: %v", err)
 	}
 }

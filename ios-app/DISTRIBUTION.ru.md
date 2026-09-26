@@ -26,7 +26,7 @@
 |---|---|
 | Bundle ID | `com.p1neapplexpress-saharev.openflux` |
 | Team ID | `8GQH8GQ252` (Alexandr Revin, Individual) |
-| Marketing version | `1.0.0` |
+| Marketing version | `1.1.1` (исходники, build 19) |
 | Deployment target | iOS 15.0 |
 | Architecture | arm64 (device) |
 | ASC API Key ID | `<KEY_ID>` |
@@ -42,6 +42,11 @@
 Результат: `ios-app/build/export/OpenFlux.ipa` (подписан для App Store).
 
 ## Загрузка в TestFlight
+
+Текущий CI-артефакт `OpenFlux-unsigned.ipa` не подписан и не загружен в
+TestFlight. Для автоматического обновления на iPhone нужен новый подписанный
+build из этого коммита в той же записи App Store Connect и включённый
+переключатель **Automatic Updates** на странице приложения в TestFlight.
 
 ```bash
 xcrun altool --upload-app -f ios-app/build/export/OpenFlux.ipa -t ios \

@@ -38,6 +38,14 @@ Produces `ios-app/build/export/OpenFlux.ipa`, distribution-signed for the App St
    Or open `ios-app/build/OpenFlux.xcarchive` in Xcode Organizer and use **Distribute App**.
 3. The build appears in TestFlight after Apple processing (a few minutes).
 
+TestFlight installs newer signed beta builds automatically when **Automatic
+Updates** is enabled for OpenFlux in the TestFlight app. The app's About screen
+shows its version and opens the TestFlight page. GitHub's unsigned IPA is only a
+CI artifact and cannot update an installed iPhone app.
+The public beta link in the root README belongs to the original app; publishing
+this fork requires access to its signing and App Store Connect channel or a
+separate signed app record.
+
 ## Notes / follow-ups
 - Deployment target: iOS 15.0 (SwiftUI App lifecycle). The Go lib is built with
   `-miphoneos-version-min=13.0`, so it is compatible.

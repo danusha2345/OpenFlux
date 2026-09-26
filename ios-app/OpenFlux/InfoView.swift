@@ -4,7 +4,17 @@ import UIKit
 /// About screen with donation addresses (tap a row to copy).
 struct InfoView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openURL) private var openURL
     @State private var copied: String?
+
+    private let testFlightURL = URL(string: "https://testflight.apple.com/")!
+
+    private var appVersion: String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info["CFBundleVersion"] as? String ?? "?"
+        return "\(version) (\(build))"
+    }
 
     private let sol = "7yXWW2iAkKadyVvMjZLPYo1PqizvKqseG2ZQ1sZk9X1k"
     private let eth = "0xd043E852158C13C8064a73b9cDd920DaAa80f0c1"
@@ -18,6 +28,19 @@ struct InfoView: View {
                         Text("TCP-туннель через скрытый транспорт. Клиент поднимает локальный SOCKS5 и системный VPN, трафик идёт через exit-node.")
                             .font(.footnote).foregroundColor(.secondary)
                     }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Версия \(appVersion)").font(.headline)
+                        Text("Новые подписанные сборки устанавливает TestFlight. Включите «Автоматические обновления» на странице OpenFlux в TestFlight.")
+                            .font(.caption).foregroundColor(.secondary)
+                        Button("Открыть TestFlight") {
+                            openURL(testFlightURL)
+                        }
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
 
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Поддержать разработку ♥")

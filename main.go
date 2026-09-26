@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -20,8 +21,12 @@ import (
 	"openflux/transport/yandex"
 	"openflux/tunnel"
 	"openflux/tunnel/l3"
+	"openflux/updater"
 	"openflux/utils"
 )
+
+// Set by release builds with -ldflags "-X main.version=0.1.2".
+var version = "dev"
 
 var (
 	globalDocUrl string
@@ -86,7 +91,17 @@ const (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--complete-update" {
+		if err := updater.CompletePending(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	fmt.Print("written by p1neappleXpress\n")
+	showVersion := flag.Bool("version", false, "Print the release version")
+	checkUpdate := flag.Bool("check-update", false, "Check GitHub Releases for a newer CLI")
+	selfUpdate := flag.Bool("self-update", false, "Install a verified CLI release and restart")
+	autoUpdate := flag.Bool("auto-update", true, "Client: install compatible CLI updates on startup")
 
 	role := flag.String("role", roleClient, "client | exit | bench-send | bench-sink")
 	inbound := flag.String("inbound", "", "tun | socks5 (client only; default: tun on macOS, socks5 elsewhere)")
@@ -204,6 +219,12 @@ BENCHMARK  (only with --role=bench-*)
 LOGGING
   -d, --debug                  Verbose per-packet logging.
 
+UPDATES  (CLI clients; servers update through a controlled deployment)
+      --version                Print the release version.
+      --check-update           Check for a newer release without installing it.
+      --self-update            Verify and install a newer CLI release.
+      --auto-update=false      Disable the startup update check on clients.
+
 DEPRECATED (removed in v2)
   -client, -exit-node      -> --role=client|exit
   -tun, -socks5-mode       -> --inbound=tun|socks5
@@ -216,6 +237,16 @@ DEPRECATED (removed in v2)
 	os.Args = expandShortFlags(os.Args)
 	flag.Parse()
 	trafficEvery = *trafficInterval
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
+	if *checkUpdate || *selfUpdate {
+		if runUpdate(*selfUpdate, false) {
+			return
+		}
+		return
+	}
 
 	// Map deprecated flags to their new counterparts. New flags win over
 	// deprecated ones if both are supplied.
@@ -260,6 +291,9 @@ DEPRECATED (removed in v2)
 		log.Printf("warning: -encryption-key-file is deprecated, use --psk-file; " +
 			"the encrypted transport now also needs --exit-key-file on the exit node and --peer-key on the client")
 		*pskFile = *depEncryptionKeyFile
+	}
+	if *autoUpdate && *role == roleClient && runtime.GOOS != "android" && version != "dev" && runUpdate(true, true) {
+		return
 	}
 
 	// Platform defaults. The recommended client path is utun on macOS and
@@ -428,6 +462,68 @@ DEPRECATED (removed in v2)
 	default:
 		log.Fatalf("unhandled role %q", *role)
 	}
+}
+
+// runUpdate returns true only when the replacement was started. An automatic
+// check is best-effort; it must not prevent the client from connecting.
+func runUpdate(install, automatic bool) bool {
+	if runtime.GOOS == "android" {
+		if !automatic {
+			fmt.Println("Android app updates are installed through the APK")
+		}
+		return false
+	}
+	if version == "dev" {
+		if !automatic {
+			fmt.Println("Development build: no release version to compare")
+		}
+		return false
+	}
+	timeout := 8 * time.Second
+	if automatic {
+		timeout = 3 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	available, err := updater.Check(ctx, version)
+	if err != nil {
+		if !automatic {
+			log.Fatalf("Update check failed: %v", err)
+		}
+		return false
+	}
+	if available == nil {
+		if !automatic {
+			fmt.Println("Already up to date")
+		}
+		return false
+	}
+	if !install {
+		fmt.Printf("New release available: %s\n", available.Version)
+		return false
+	}
+	if automatic && !updater.AutoCompatible(version, available.Version) {
+		log.Printf("New release %s needs an explicit --self-update", available.Version)
+		return false
+	}
+	staged, err := updater.Download(context.Background(), available)
+	if err != nil {
+		if !automatic {
+			log.Fatalf("Update download failed: %v", err)
+		}
+		log.Printf("Update download failed: %v", err)
+		return false
+	}
+	if err := updater.Install(staged, version, os.Args[1:]); err != nil {
+		_ = os.Remove(staged)
+		if !automatic {
+			log.Fatalf("Update installation failed: %v", err)
+		}
+		log.Printf("Update installation failed: %v", err)
+		return false
+	}
+	log.Printf("Installed OpenFlux %s; starting the new version", available.Version)
+	return true
 }
 
 // newStream builds the transport stack for one document: the raw transport,

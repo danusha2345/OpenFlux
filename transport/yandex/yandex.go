@@ -6,12 +6,15 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	neturl "net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -84,7 +87,9 @@ type YandexDocsTransport struct {
 	wg     sync.WaitGroup
 
 	// tlsConfig overrides the WebSocket TLS settings; tests only.
-	tlsConfig *tls.Config
+	tlsConfig     *tls.Config
+	cookieFile    string
+	challengeFile string
 }
 
 // stopWaitTimeout bounds how long Stop waits for the transport's goroutines.
@@ -99,6 +104,10 @@ func NewYandexDocsTransport(url string, config transport.TransportConfig) *Yande
 	}
 	t.baseUserID = randUserID()
 	return t
+}
+
+func (t *YandexDocsTransport) ConfigureManualChallenge(cookieFile, challengeFile string) {
+	t.cookieFile, t.challengeFile = cookieFile, challengeFile
 }
 
 func (t *YandexDocsTransport) Start() error {
@@ -241,6 +250,13 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 
 		info, err := t.fetchDocInfo(ctx, t.url, userID)
 		if err != nil {
+			if errors.Is(err, ErrManualChallenge) {
+				utils.Infof("[YDOCS] browser verification required; challenge file: %s", t.challengeFile)
+				if waitForCookieChange(ctx, t.cookieFile) {
+					t.connectToDoc(attempt + 1)
+				}
+				return
+			}
 			utils.Debugf("[YDOCS] fetchDocInfo failed: %v", err)
 			t.scheduleReconnect(attempt)
 			return
@@ -812,10 +828,20 @@ func reconnectBackoff(n int) time.Duration {
 }
 
 func (t *YandexDocsTransport) fetchDocInfo(ctx context.Context, url, userID string) (YandexDocsInfo, error) {
+	jar, _ := cookiejar.New(nil)
+	if t.cookieFile != "" {
+		if err := loadYandexCookies(t.cookieFile, jar); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return YandexDocsInfo{}, err
+		}
+	}
 	client := &http.Client{
+		Jar: jar,
 		// Cap redirects so an auth/login redirect loop fails fast instead of
 		// hanging until the timeout (a private doc redirects to passport).
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if isChallengeURL(req.URL.String()) {
+				return http.ErrUseLastResponse
+			}
 			if len(via) >= 10 {
 				return fmt.Errorf("stopped after 10 redirects (login required? doc not public?)")
 			}
@@ -825,22 +851,28 @@ func (t *YandexDocsTransport) fetchDocInfo(ctx context.Context, url, userID stri
 	}
 
 	utils.Debugf("[YDOCS] fetchDocInfo GET %s", maskURL(url))
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return YandexDocsInfo{}, err
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := client.Do(req)
 	if err != nil {
 		return YandexDocsInfo{}, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 && isChallengeURL(resp.Header.Get("Location")) {
+		return YandexDocsInfo{}, recordChallenge(resp.Request.URL.String(), resp.Header.Get("Location"), t.challengeFile)
+	}
+	if isChallengeURL(resp.Request.URL.String()) {
+		return YandexDocsInfo{}, recordChallenge(resp.Request.URL.String(), resp.Request.URL.String(), t.challengeFile)
+	}
 
 	htmlBytes, _ := io.ReadAll(resp.Body)
 	html := string(htmlBytes)
 	utils.Debugf("[YDOCS] response status=%d finalURL=%s body=%dB", resp.StatusCode, maskURL(resp.Request.URL.String()), len(html))
 
-	var cookies []string
-	for _, c := range resp.Cookies() {
-		cookies = append(cookies, fmt.Sprintf("%s=%s", c.Name, c.Value))
-	}
+	cookieHeader := mergeCookies("", jar.Cookies(resp.Request.URL))
 
 	matches := clientConfigRe.FindStringSubmatch(html)
 	if len(matches) < 2 {
@@ -849,7 +881,7 @@ func (t *YandexDocsTransport) fetchDocInfo(ctx context.Context, url, userID stri
 		if strings.Contains(html, "passport") || strings.Contains(strings.ToLower(html), "login") {
 			hint = "looks like a login page (doc not public?)"
 		}
-		return YandexDocsInfo{}, fmt.Errorf("config not found: %s (status %d, final %s)", hint, resp.StatusCode, resp.Request.URL.String())
+		return YandexDocsInfo{}, fmt.Errorf("config not found: %s (status %d, final %s)", hint, resp.StatusCode, maskURL(resp.Request.URL.String()))
 	}
 
 	var config map[string]interface{}
@@ -894,7 +926,7 @@ func (t *YandexDocsTransport) fetchDocInfo(ctx context.Context, url, userID stri
 	}
 
 	return YandexDocsInfo{
-		CookieStr:   strings.Join(cookies, "; "),
+		CookieStr:   cookieHeader,
 		Token:       token,
 		DocID:       docKey,
 		Origin:      balancerURL,

@@ -6,11 +6,13 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -137,9 +139,18 @@ type volgaAuth struct {
 }
 
 func authorize(ctx context.Context, docURL string) (*volgaAuth, error) {
+	return authorizeWithManual(ctx, docURL, "", "")
+}
+
+func authorizeWithManual(ctx context.Context, docURL, cookieFile, challengeFile string) (*volgaAuth, error) {
 	utils.Debugf("[VOLGA] authorizing document")
 
 	jar, _ := cookiejar.New(nil)
+	if cookieFile != "" {
+		if err := loadYandexCookies(cookieFile, jar); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
 	session := &http.Client{
 		Jar: jar,
 		Transport: &http.Transport{
@@ -175,6 +186,10 @@ func authorize(ctx context.Context, docURL string) (*volgaAuth, error) {
 		if err != nil {
 			return nil, fmt.Errorf("GET %s: %w", maskURL(currentURL), err)
 		}
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 && isChallengeURL(resp.Header.Get("Location")) {
+			resp.Body.Close()
+			return nil, recordChallenge(currentURL, resp.Header.Get("Location"), challengeFile)
+		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
@@ -185,8 +200,8 @@ func authorize(ctx context.Context, docURL string) (*volgaAuth, error) {
 			if loc == "" {
 				return nil, fmt.Errorf("redirect without Location from %s", maskURL(currentURL))
 			}
-			if strings.Contains(loc, "showcaptchafast") {
-				return nil, fmt.Errorf("Yandex requested interactive verification")
+			if isChallengeURL(loc) {
+				return nil, recordChallenge(currentURL, loc, challengeFile)
 			}
 			ref, err := url.Parse(loc)
 			if err != nil {
@@ -198,6 +213,9 @@ func authorize(ctx context.Context, docURL string) (*volgaAuth, error) {
 
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("unexpected status %d from %s", resp.StatusCode, maskURL(currentURL))
+		}
+		if isChallengeURL(currentURL) {
+			return nil, recordChallenge(currentURL, currentURL, challengeFile)
 		}
 		finalBody = body
 		finalURL = currentURL
@@ -1138,6 +1156,12 @@ type YandexVolgaTransport struct {
 	onData   func([]byte)
 
 	keepAliveStop chan struct{}
+	cookieFile    string
+	challengeFile string
+}
+
+func (t *YandexVolgaTransport) ConfigureManualChallenge(cookieFile, challengeFile string) {
+	t.cookieFile, t.challengeFile = cookieFile, challengeFile
 }
 
 func NewYandexVolgaTransport(docURL string, cfg transport.TransportConfig) *YandexVolgaTransport {
@@ -1177,12 +1201,26 @@ func (t *YandexVolgaTransport) Start() error {
 	}
 
 	utils.Debugf("[VOLGA] authorizing...")
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
 	t.startupDone, t.startupCancel = done, cancel
 	t.lifecycleMu.Unlock()
-	auth, err := authorize(ctx, t.docURL)
+	var auth *volgaAuth
+	var err error
+	for {
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, 60*time.Second)
+		auth, err = authorizeWithManual(attemptCtx, t.docURL, t.cookieFile, t.challengeFile)
+		attemptCancel()
+		if !errors.Is(err, ErrManualChallenge) || t.cookieFile == "" || ctx.Err() != nil {
+			break
+		}
+		utils.Infof("[VOLGA] browser verification required; challenge file: %s", t.challengeFile)
+		if !waitForCookieChange(ctx, t.cookieFile) {
+			err = ctx.Err()
+			break
+		}
+	}
 	t.lifecycleMu.Lock()
 	defer t.lifecycleMu.Unlock()
 	defer close(done)
@@ -1199,6 +1237,9 @@ func (t *YandexVolgaTransport) Start() error {
 
 	t.stateMu.Lock()
 	t.relay = newRelayClient(auth, t.config, t.stats)
+	t.relay.authorize = func(ctx context.Context, doc string) (*volgaAuth, error) {
+		return authorizeWithManual(ctx, doc, t.cookieFile, t.challengeFile)
+	}
 	t.stateMu.Unlock()
 
 	t.ws = newWSListener(auth, t.config, t.stats, t.relay, func(data []byte) {

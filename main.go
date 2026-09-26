@@ -105,6 +105,8 @@ func main() {
 		"Exit: allow reaching private/loopback/link-local networks and cloud metadata (169.254.169.254). Off by default")
 	pskFile := flag.String("psk-file", "",
 		"Optional, both peers: file with a shared secret (16+ characters). The exit node then refuses clients without it")
+	yandexCookiesFile := flag.String("yandex-cookies-file", "", "Netscape cookies.txt for manual Yandex browser verification")
+	yandexChallengeFile := flag.String("yandex-challenge-file", "", "Private file where a Yandex challenge URL is saved for manual opening")
 
 	flag.StringVar(&globalDocUrl, "url", "http://#",
 		"Document URL. A comma-separated list (yandex, vyandex) runs the tunnel over several documents at once")
@@ -178,6 +180,11 @@ MODE  (only with --role=exit)
 TRANSPORT MODIFIERS
   -c, --codec=batched          zstd + coalescing. Default.
   -c, --codec=legacy           Per-packet LZ4. A/B only.
+
+YANDEX BROWSER VERIFICATION
+      --yandex-challenge-file=<path>  Save a challenge URL privately for manual opening.
+      --yandex-cookies-file=<path>    Reload a Netscape cookies.txt (mode 0600)
+                                      after the browser has passed the check.
 
 ENCRYPTION  (Noise NKpsk0: X25519 + AES-256-GCM, session keys rotate every 2 min)
       --exit-key-file=<path>   Exit: static key file, created on first run. The public
@@ -390,7 +397,7 @@ DEPRECATED (removed in v2)
 	// Every document gets a complete stream of its own (transport, encryption,
 	// codec), so each carries exactly the single-document wire format.
 	trans := newDocStreams(urls, func(docURL string) transport.Transport {
-		return newStream(*transportType, docURL, *role, *codec, enc, config)
+		return newStream(*transportType, docURL, *role, *codec, enc, config, *yandexCookiesFile, *yandexChallengeFile)
 	})
 
 	// Benchmark modes run the transport directly with no tunnel / raw socket,
@@ -425,13 +432,17 @@ DEPRECATED (removed in v2)
 
 // newStream builds the transport stack for one document: the raw transport,
 // optional encryption directly on it, and the app-layer codec outermost.
-func newStream(transportType, docURL, role, codec string, enc *encryptionSetup, config transport.TransportConfig) transport.Transport {
+func newStream(transportType, docURL, role, codec string, enc *encryptionSetup, config transport.TransportConfig, cookieFile, challengeFile string) transport.Transport {
 	var inner transport.Transport
 	switch transportType {
 	case "vyandex":
-		inner = yandex.NewYandexVolgaTransport(docURL, config)
+		t := yandex.NewYandexVolgaTransport(docURL, config)
+		t.ConfigureManualChallenge(cookieFile, challengeFile)
+		inner = t
 	case "yandex":
-		inner = yandex.NewYandexDocsTransport(docURL, config)
+		t := yandex.NewYandexDocsTransport(docURL, config)
+		t.ConfigureManualChallenge(cookieFile, challengeFile)
+		inner = t
 	case "oneme":
 		uidint, _ := strconv.ParseInt(maxUid, 10, 64)
 		inner = oneme.NewOneMeTransport(role == roleExit, maxToken, uidint, config)

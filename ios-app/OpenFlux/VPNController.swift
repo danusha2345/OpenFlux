@@ -55,8 +55,10 @@ final class VPNController: ObservableObject {
         }
     }
 
-    func start(transport: String, url: String, maxToken: String, maxUid: String, peerKey: String) {
+    func start(transport: String, settings: ConnectionSettings) {
         guard operation == nil, !active else { return }
+        do { try SharedConnectionSettings.save(settings) }
+        catch { status = "Error: \(error.localizedDescription)"; return }
         active = true
         status = "Preparing…"
         operation = Task {
@@ -74,10 +76,7 @@ final class VPNController: ObservableObject {
                 let proto = NETunnelProviderProtocol()
                 proto.providerBundleIdentifier = extensionBundleId
                 proto.serverAddress = "OpenFlux"
-                proto.providerConfiguration = [
-                    "transport": transport, "url": url,
-                    "maxToken": maxToken, "maxUid": maxUid, "peerKey": peerKey,
-                ]
+                proto.providerConfiguration = ["transport": transport]
                 m.protocolConfiguration = proto
                 m.localizedDescription = "OpenFlux"
                 m.isEnabled = true
@@ -101,6 +100,40 @@ final class VPNController: ObservableObject {
                 status = cancelled ? "Disconnected" : "Error: \(error.localizedDescription)"
             }
         }
+    }
+
+    /// Merge old app/profile values before removing their plaintext copies.
+    func migrateLegacyConfiguration(_ current: ConnectionSettings) async throws -> ConnectionSettings {
+        try await load()
+        let stored = try SharedConnectionSettings.load()
+        var settings = stored ?? current
+        let proto = manager?.protocolConfiguration as? NETunnelProviderProtocol
+        var conf = proto?.providerConfiguration ?? [:]
+        let oldKeys = ["url", "maxToken", "maxUid", "peerKey"]
+        if stored == nil {
+            if settings.url.isEmpty { settings.url = conf["url"] as? String ?? "" }
+            if settings.maxToken.isEmpty { settings.maxToken = conf["maxToken"] as? String ?? "" }
+            if settings.maxUid.isEmpty { settings.maxUid = conf["maxUid"] as? String ?? "" }
+            if settings.peerKey.isEmpty { settings.peerKey = conf["peerKey"] as? String ?? "" }
+        }
+        if stored == nil && (!settings.url.isEmpty || !settings.maxToken.isEmpty ||
+                             !settings.maxUid.isEmpty || !settings.peerKey.isEmpty) {
+            try SharedConnectionSettings.save(settings)
+        }
+        if let manager, let proto, oldKeys.contains(where: { conf[$0] != nil }) {
+            let original = conf
+            for key in oldKeys { conf.removeValue(forKey: key) }
+            proto.providerConfiguration = conf
+            manager.protocolConfiguration = proto
+            do { try await manager.saveToPreferences() }
+            catch {
+                proto.providerConfiguration = original
+                manager.protocolConfiguration = proto
+                throw error
+            }
+        }
+        SharedConnectionSettings.clearLegacyValues()
+        return settings
     }
 
     func stop() {

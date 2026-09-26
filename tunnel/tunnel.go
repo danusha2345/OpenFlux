@@ -315,6 +315,10 @@ func (t *TCPTunnel) setupClient(tunnelNIC tcpip.NICID) {
 	})
 }
 
+// A disconnected carrier cannot answer the SYN; bound the wait seen by
+// SOCKS5 and mobile callers.
+var dialTimeout = 10 * time.Second
+
 func (t *TCPTunnel) DialTCP(address string) (net.Conn, error) {
 	tcpAddr, err := net.ResolveTCPAddr("tcp", address)
 	if err != nil {
@@ -332,13 +336,18 @@ func (t *TCPTunnel) DialTCP(address string) (net.Conn, error) {
 		nic = tcpip.NICID(2)
 	}
 
-	conn, err := gonet.DialTCP(t.gvisorStack, tcpip.FullAddress{
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	conn, err := gonet.DialContextTCP(ctx, t.gvisorStack, tcpip.FullAddress{
 		NIC:  nic,
 		Addr: tcpip.AddrFrom4([4]byte{ip[0], ip[1], ip[2], ip[3]}),
 		Port: uint16(tcpAddr.Port),
 	}, ipv4.ProtocolNumber)
 
-	return conn, err
+	if err != nil {
+		return nil, err // avoid a typed nil *TCPConn in a non-nil net.Conn
+	}
+	return conn, nil
 }
 
 func (t *TCPTunnel) ListenTCP(port uint16) (net.Listener, error) {
@@ -369,7 +378,6 @@ func (t *TCPTunnel) printStats() {
 		)
 	}
 }
-
 
 // Close releases the gVisor stack and stops the stats goroutine. Safe to call
 // more than once.

@@ -5,10 +5,9 @@ struct ContentView: View {
     @StateObject private var vpn = VPNController()
 
     @AppStorage("transportKind") private var transportRaw: String = TransportKind.yandex.rawValue
-    @AppStorage("docURL") private var docURL: String = ""
-    @AppStorage("maxToken") private var maxToken: String = ""
-    @AppStorage("maxUid") private var maxUid: String = ""
-    @AppStorage("peerKey") private var peerKey: String = ""
+    @State private var secureSettings = ConnectionSettings()
+    @State private var settingsLoaded = false
+    @State private var settingsError: String?
     // Uncommon default port to avoid clashing with other local proxies.
     @AppStorage("socksPort") private var socksPort: String = "10808"
     @AppStorage("debugLog") private var debugLog: Bool = false
@@ -20,11 +19,12 @@ struct ContentView: View {
 
     private var canStart: Bool {
         guard (Int(socksPort) ?? 0) > 0,
-              !peerKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+              settingsLoaded, settingsError == nil,
+              !secureSettings.peerKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         switch transport {
         case .yandex, .vyandex, .cupsonline, .mailru:
-            return !docURL.trimmingCharacters(in: .whitespaces).isEmpty
-        case .max:    return !maxToken.isEmpty && !maxUid.isEmpty
+            return !secureSettings.url.trimmingCharacters(in: .whitespaces).isEmpty
+        case .max:    return !secureSettings.maxToken.isEmpty && !secureSettings.maxUid.isEmpty
         }
     }
 
@@ -40,20 +40,27 @@ struct ContentView: View {
                         }
                     }
                     .pickerStyle(.menu)
-                    .disabled(tunnel.running || vpn.active)
+                    .disabled(!settingsLoaded || tunnel.running || vpn.active)
 
                     connectionFields
 
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Exit public key (Noise)").font(.caption).foregroundColor(.secondary)
-                        SecureField("base64 X25519 public key", text: $peerKey)
+                        SecureField("base64 X25519 public key", text: secureBinding(\.peerKey))
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled(true)
                             .textFieldStyle(.roundedBorder)
-                            .disabled(tunnel.running || vpn.active)
+                            .disabled(!settingsLoaded || tunnel.running || vpn.active)
                     }
 
                     portField
+
+                    if let settingsError {
+                        Text(settingsError).font(.caption).foregroundColor(.red)
+                        Button("Retry loading settings") {
+                            Task { await loadSecureSettings() }
+                        }
+                    }
 
                     controls
 
@@ -64,7 +71,10 @@ struct ContentView: View {
                 .padding()
             }
             .navigationTitle("OpenFlux")
-            .onAppear { OpenFluxSetDebug(debugLog ? 1 : 0) }
+            .task {
+                OpenFluxSetDebug(debugLog ? 1 : 0)
+                await loadSecureSettings()
+            }
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button { showInfo = true } label: {
@@ -83,10 +93,10 @@ struct ContentView: View {
         case .yandex, .vyandex, .cupsonline, .mailru:
             field(title: transport.title + " URL / room data",
                   placeholder: transport == .mailru ? "https://cloud.mail.ru/public/..." : "Document or room URL",
-                  text: $docURL)
+                  text: secureBinding(\.url))
         case .max:
-            field(title: "MAX token", placeholder: "auth token", text: $maxToken)
-            field(title: "MAX user ID", placeholder: "numeric id", text: $maxUid,
+            field(title: "MAX token", placeholder: "auth token", text: secureBinding(\.maxToken))
+            field(title: "MAX user ID", placeholder: "numeric id", text: secureBinding(\.maxUid),
                   keyboard: .numberPad)
         }
     }
@@ -97,7 +107,7 @@ struct ContentView: View {
             TextField("10808", text: $socksPort)
                 .keyboardType(.numberPad)
                 .textFieldStyle(.roundedBorder)
-                .disabled(tunnel.running || vpn.active)
+                .disabled(!settingsLoaded || tunnel.running || vpn.active)
         }
     }
 
@@ -112,10 +122,10 @@ struct ContentView: View {
                 } else {
                     Button {
                         tunnel.start(transport: transport,
-                                     url: docURL,
-                                     maxToken: maxToken,
-                                     maxUid: maxUid,
-                                     peerKey: peerKey,
+                                     url: secureSettings.url,
+                                     maxToken: secureSettings.maxToken,
+                                     maxUid: secureSettings.maxUid,
+                                     peerKey: secureSettings.peerKey,
                                      port: Int(socksPort) ?? 10808)
                     } label: {
                         Label("Start", systemImage: "play.fill").frame(maxWidth: .infinity)
@@ -151,8 +161,7 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
             } else {
                 Button {
-                    vpn.start(transport: transport.rawValue, url: docURL,
-                              maxToken: maxToken, maxUid: maxUid, peerKey: peerKey)
+                    vpn.start(transport: transport.rawValue, settings: secureSettings)
                 } label: {
                     Label("Start VPN", systemImage: "bolt.fill").frame(maxWidth: .infinity)
                 }
@@ -173,7 +182,31 @@ struct ContentView: View {
                 .autocorrectionDisabled(true)
                 .keyboardType(keyboard)
                 .textFieldStyle(.roundedBorder)
-                .disabled(tunnel.running || vpn.active)
+                .disabled(!settingsLoaded || tunnel.running || vpn.active)
+        }
+    }
+
+    private func secureBinding(_ keyPath: WritableKeyPath<ConnectionSettings, String>) -> Binding<String> {
+        Binding(get: { secureSettings[keyPath: keyPath] }, set: { value in
+            secureSettings[keyPath: keyPath] = value
+            do {
+                try SharedConnectionSettings.save(secureSettings)
+                settingsError = nil
+            } catch {
+                settingsError = "Cannot save connection settings: \(error.localizedDescription)"
+            }
+        })
+    }
+
+    private func loadSecureSettings() async {
+        guard !settingsLoaded else { return }
+        do {
+            let saved = try SharedConnectionSettings.loadOrReadLegacy()
+            secureSettings = try await vpn.migrateLegacyConfiguration(saved)
+            settingsLoaded = true
+            settingsError = nil
+        } catch {
+            settingsError = "Cannot load connection settings: \(error.localizedDescription)"
         }
     }
 

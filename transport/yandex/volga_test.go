@@ -28,6 +28,37 @@ func testVolgaAuth(token string) *volgaAuth {
 	return &volgaAuth{Token: token, docURL: "https://example.invalid/doc", Session: &http.Client{Jar: jar}}
 }
 
+func TestVolgaAuthorizationRejectsChallengeAndHTTPFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		want   string
+	}{
+		{"challenge", http.StatusFound, "interactive verification"},
+		{"server-error", http.StatusInternalServerError, "unexpected status 500"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("User-Agent"); got != volgaUserAgent {
+					t.Errorf("User-Agent = %q", got)
+				}
+				if tc.status == http.StatusFound {
+					w.Header().Set("Location", "/showcaptchafast?token=secret")
+				}
+				w.WriteHeader(tc.status)
+			}))
+			defer server.Close()
+			_, err := authorize(context.Background(), server.URL+"/document?key=secret")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("authorize error = %v, want %q", err, tc.want)
+			}
+			if strings.Contains(err.Error(), "secret") {
+				t.Fatalf("authorization error exposed URL query: %v", err)
+			}
+		})
+	}
+}
+
 func TestVolgaConcurrentAuthRefresh(t *testing.T) {
 	for _, status := range []int{401, 403} {
 		t.Run(http.StatusText(status), func(t *testing.T) {

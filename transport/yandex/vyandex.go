@@ -76,7 +76,7 @@ func DefaultVolgaConfig() VolgaConfig {
 	}
 }
 
-const volgaUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
+const volgaUserAgent = "Mozilla/5.0"
 
 var reClientConfig = regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
 
@@ -173,17 +173,20 @@ func authorize(ctx context.Context, docURL string) (*volgaAuth, error) {
 
 		resp, err := session.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("GET %s: %w", currentURL, err)
+			return nil, fmt.Errorf("GET %s: %w", maskURL(currentURL), err)
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		utils.Debugf("[VOLGA] GET %s -> %d (%d bytes)", currentURL, resp.StatusCode, len(body))
+		utils.Debugf("[VOLGA] GET %s -> %d (%d bytes)", maskURL(currentURL), resp.StatusCode, len(body))
 
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			loc := resp.Header.Get("Location")
 			if loc == "" {
-				return nil, fmt.Errorf("redirect without Location from %s", currentURL)
+				return nil, fmt.Errorf("redirect without Location from %s", maskURL(currentURL))
+			}
+			if strings.Contains(loc, "showcaptchafast") {
+				return nil, fmt.Errorf("Yandex requested interactive verification")
 			}
 			ref, err := url.Parse(loc)
 			if err != nil {
@@ -193,16 +196,19 @@ func authorize(ctx context.Context, docURL string) (*volgaAuth, error) {
 			continue
 		}
 
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("unexpected status %d from %s", resp.StatusCode, maskURL(currentURL))
+		}
 		finalBody = body
 		finalURL = currentURL
 		break
 	}
 
 	if finalBody == nil {
-		return nil, fmt.Errorf("too many redirects from %s", docURL)
+		return nil, fmt.Errorf("too many redirects from %s", maskURL(docURL))
 	}
 
-	utils.Debugf("[VOLGA] final URL: %s", finalURL)
+	utils.Debugf("[VOLGA] final URL: %s", maskURL(finalURL))
 
 	m := reClientConfig.FindSubmatch(finalBody)
 	if len(m) < 2 {
@@ -211,7 +217,7 @@ func authorize(ctx context.Context, docURL string) (*volgaAuth, error) {
 			preview = preview[:3000]
 		}
 		_ = preview // the page may embed access_token; not logged
-		return nil, fmt.Errorf("client-config not found in %s", finalURL)
+		return nil, fmt.Errorf("client-config not found in %s", maskURL(finalURL))
 	}
 
 	var cfg map[string]interface{}
@@ -1135,10 +1141,25 @@ type YandexVolgaTransport struct {
 }
 
 func NewYandexVolgaTransport(docURL string, cfg transport.TransportConfig) *YandexVolgaTransport {
+	return newYandexVolgaTransport(docURL, cfg, DefaultVolgaConfig())
+}
+
+// NewYandexVolgaMobileTransport bounds queued frames and idle connections
+// inside the iOS extension. The wire format matches the desktop transport.
+func NewYandexVolgaMobileTransport(docURL string, cfg transport.TransportConfig) *YandexVolgaTransport {
+	volga := DefaultVolgaConfig()
+	volga.QueueSize = 128
+	volga.BatchMaxBytes = 128 * 1024
+	volga.MaxIdleConns = 8
+	volga.MaxIdleConnsPerHost = 4
+	return newYandexVolgaTransport(docURL, cfg, volga)
+}
+
+func newYandexVolgaTransport(docURL string, cfg transport.TransportConfig, volga VolgaConfig) *YandexVolgaTransport {
 	return &YandexVolgaTransport{
 		BaseTransport: transport.NewBaseTransport(cfg),
 		docURL:        docURL,
-		config:        DefaultVolgaConfig(),
+		config:        volga,
 		stats:         &VolgaStats{},
 		keepAliveStop: make(chan struct{}),
 	}

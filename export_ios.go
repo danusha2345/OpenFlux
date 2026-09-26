@@ -146,7 +146,7 @@ func newBridgeDocStreams(transportType, docURL string, enc *encryptionSetup, con
 	t := newDocStreams(splitURLs(docURL), func(u string) transport.Transport {
 		var raw transport.Transport
 		if transportType == "vyandex" {
-			raw = yandex.NewYandexVolgaTransport(u, config)
+			raw = yandex.NewYandexVolgaMobileTransport(u, config)
 		} else {
 			raw = yandex.NewYandexDocsTransport(u, config)
 		}
@@ -169,7 +169,7 @@ func newBridgeStream(raw transport.Transport, enc *encryptionSetup) (transport.T
 			return nil, err
 		}
 	}
-	return transport.NewBatchedTransport(raw), nil
+	return transport.NewBatchedTransportWithQueueDepth(raw, 128), nil
 }
 
 // OpenFluxStartClient starts the SOCKS5 client tunnel.
@@ -227,6 +227,7 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 	}
 
 	config := transport.DefaultConfig()
+	config.MaxQueueSize = 128
 	var t transport.Transport
 	switch tt {
 	case "yandex", "", "vyandex":

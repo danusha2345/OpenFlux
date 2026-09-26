@@ -34,7 +34,7 @@ func TestVolgaAuthorizationRejectsChallengeAndHTTPFailure(t *testing.T) {
 		status int
 		want   string
 	}{
-		{"challenge", http.StatusFound, "interactive verification"},
+		{"challenge", http.StatusFound, "browser verification"},
 		{"server-error", http.StatusInternalServerError, "unexpected status 500"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

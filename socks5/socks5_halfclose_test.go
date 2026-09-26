@@ -9,10 +9,16 @@ import (
 
 type pipeDialer struct{ server net.Conn }
 
+// net.Pipe has no write half-close. Model the target's CloseWrite so the
+// handler can finish the request direction without discarding its reply.
+type halfClosePipe struct{ net.Conn }
+
+func (halfClosePipe) CloseWrite() error { return nil }
+
 func (d *pipeDialer) DialTCP(string) (net.Conn, error) {
 	client, server := net.Pipe()
 	d.server = server
-	return client, nil
+	return halfClosePipe{client}, nil
 }
 
 // After the client half-closes its write side, the target's reply must still

@@ -398,6 +398,8 @@ Start clients with --peer-key=<ключ в base64>
 ```
 # Yandex Volga (HTTP relay + WS)
 ./openflux --role=exit --mode=l3 --transport=vyandex --url="..." --debug
+# При проверке Яндекса: --yandex-challenge-file и --yandex-cookies-file;
+# процедура ручного прохождения — docs/YANDEX-OPERATIONS.ru.md.
 
 # MAX / OneMe (WebRTC DataChannel)
 ./openflux --role=exit --mode=l3 --transport=oneme \

@@ -26,7 +26,7 @@
 |---|---|
 | Bundle ID | `com.p1neapplexpress-saharev.openflux` |
 | Team ID | `8GQH8GQ252` (Alexandr Revin, Individual) |
-| Marketing version | `1.1.1` (исходники, build 19) |
+| Marketing version | `1.1.2` (исходники, build 20) |
 | Deployment target | iOS 15.0 |
 | Architecture | arm64 (device) |
 | ASC API Key ID | `<KEY_ID>` |

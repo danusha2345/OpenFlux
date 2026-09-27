@@ -46,6 +46,11 @@ The public beta link in the root README belongs to the original app; publishing
 this fork requires access to its signing and App Store Connect channel or a
 separate signed app record.
 
+The app registers `openflux://noise-v1/` links. Opening a QR link from iPhone
+Camera imports the transport URL and exit public key into the shared Keychain;
+the user reviews the settings before starting the tunnel. Links from upstream's
+AES/session format are rejected.
+
 ## Notes / follow-ups
 - Deployment target: iOS 15.0 (SwiftUI App lifecycle). The Go lib is built with
   `-miphoneos-version-min=13.0`, so it is compatible.

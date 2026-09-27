@@ -7,8 +7,8 @@ options:
 
 settings:
   base:
-    MARKETING_VERSION: "1.1.1"
-    CURRENT_PROJECT_VERSION: "19"
+    MARKETING_VERSION: "1.1.2"
+    CURRENT_PROJECT_VERSION: "20"
     DEVELOPMENT_TEAM: "8GQH8GQ252"
 
 targets:
@@ -30,6 +30,10 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleURLTypes:
+          - CFBundleURLName: com.p1neapplexpress-saharev.openflux.share
+            CFBundleURLSchemes:
+              - openflux
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:

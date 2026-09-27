@@ -12,6 +12,10 @@ struct ContentView: View {
     @AppStorage("socksPort") private var socksPort: String = "10808"
     @AppStorage("debugLog") private var debugLog: Bool = false
     @State private var showInfo = false
+    @State private var shareMessage: String?
+    @State private var pendingShare: ShareLink?
+    @State private var shareApproved = false
+    @State private var showShareConfirm = false
 
     private var transport: TransportKind {
         TransportKind(rawValue: transportRaw) ?? .yandex
@@ -33,6 +37,10 @@ struct ContentView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     statusHeader
+
+                    if let shareMessage {
+                        Text(shareMessage).font(.caption).foregroundColor(.secondary)
+                    }
 
                     Picker("Transport", selection: $transportRaw) {
                         ForEach(TransportKind.allCases) { t in
@@ -74,6 +82,18 @@ struct ContentView: View {
             .task {
                 OpenFluxSetDebug(debugLog ? 1 : 0)
                 await loadSecureSettings()
+                await MainActor.run { applyPendingShare() }
+            }
+            .onOpenURL { url in
+                Task { @MainActor in
+                    guard let shared = ShareLink.decode(url) else {
+                        shareMessage = "Ссылка OpenFlux не подходит для этого клиента"
+                        return
+                    }
+                    pendingShare = shared
+                    shareApproved = false
+                    showShareConfirm = true
+                }
             }
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -83,6 +103,15 @@ struct ContentView: View {
                 }
             }
             .sheet(isPresented: $showInfo) { InfoView() }
+            .alert("Импортировать настройки OpenFlux?", isPresented: $showShareConfirm) {
+                Button("Отмена", role: .cancel) { pendingShare = nil }
+                Button("Импортировать") {
+                    shareApproved = true
+                    applyPendingShare()
+                }
+            } message: {
+                Text("URL транспорта и публичный ключ выходной ноды будут заменены. Подключение начнётся только после нажатия Start.")
+            }
         }
         .navigationViewStyle(.stack)
     }
@@ -207,6 +236,32 @@ struct ContentView: View {
             settingsError = nil
         } catch {
             settingsError = "Cannot load connection settings: \(error.localizedDescription)"
+        }
+    }
+
+    @MainActor
+    private func applyPendingShare() {
+        guard settingsLoaded, shareApproved, let shared = pendingShare,
+              let kind = TransportKind(rawValue: shared.transport) else { return }
+        pendingShare = nil
+        shareApproved = false
+        guard !tunnel.running, !vpn.active else {
+            shareMessage = "Остановите подключение и повторите импорт"
+            return
+        }
+        var next = secureSettings
+        next.url = shared.url
+        next.peerKey = shared.peerKey
+        next.maxToken = ""
+        next.maxUid = ""
+        do {
+            try SharedConnectionSettings.save(next)
+            secureSettings = next
+            transportRaw = kind.rawValue
+            settingsError = nil
+            shareMessage = "Настройки из QR сохранены. Проверьте их и нажмите Start."
+        } catch {
+            shareMessage = "Не удалось сохранить настройки: \(error.localizedDescription)"
         }
     }
 

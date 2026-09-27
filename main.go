@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"openflux/netguard"
+	"openflux/share"
 	"openflux/socks5"
 	"openflux/transport"
 	"openflux/transport/cupsonline"
@@ -102,6 +103,7 @@ func main() {
 	checkUpdate := flag.Bool("check-update", false, "Check GitHub Releases for a newer CLI")
 	selfUpdate := flag.Bool("self-update", false, "Install a verified CLI release and restart")
 	autoUpdate := flag.Bool("auto-update", true, "Client: install compatible CLI updates on startup")
+	shareFlag := flag.Bool("share", false, "Print a Noise client link and terminal QR from an existing exit key, then exit")
 
 	role := flag.String("role", roleClient, "client | exit | bench-send | bench-sink")
 	inbound := flag.String("inbound", "", "tun | socks5 (client only; default: tun on macOS, socks5 elsewhere)")
@@ -225,6 +227,10 @@ UPDATES  (CLI clients; servers update through a controlled deployment)
       --self-update            Verify and install a newer CLI release.
       --auto-update=false      Disable the startup update check on clients.
 
+SHARE
+      --share                  Exit: print a Noise client link and QR, then exit.
+                               Uses an existing --exit-key-file and --url.
+
 DEPRECATED (removed in v2)
   -client, -exit-node      -> --role=client|exit
   -tun, -socks5-mode       -> --inbound=tun|socks5
@@ -291,6 +297,24 @@ DEPRECATED (removed in v2)
 		log.Printf("warning: -encryption-key-file is deprecated, use --psk-file; " +
 			"the encrypted transport now also needs --exit-key-file on the exit node and --peer-key on the client")
 		*pskFile = *depEncryptionKeyFile
+	}
+	if *shareFlag {
+		cfg, err := buildShare(*role, *transportType, globalDocUrl, *exitKeyFile, *pskFile, *codec)
+		if err != nil {
+			log.Fatalf("--share: %v", err)
+		}
+		link, err := share.Encode(cfg)
+		if err != nil {
+			log.Fatalf("--share: %v", err)
+		}
+		qr, err := share.Terminal(link)
+		if err != nil {
+			log.Fatalf("--share: %v", err)
+		}
+		fmt.Println("Noise client link (the document/room URL may grant access):")
+		fmt.Println(link)
+		fmt.Fprint(os.Stderr, qr)
+		return
 	}
 	if *autoUpdate && *role == roleClient && runtime.GOOS != "android" && version != "dev" && runUpdate(true, true) {
 		return

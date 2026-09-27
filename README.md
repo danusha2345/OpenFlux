@@ -431,6 +431,7 @@ Measure raw goodput through the transport, without touching the host network:
 | `--maxUid` | | | MAX user id (`--transport=oneme`) |
 | `--bench-bytes` | | `0` | MB to push (`--role=bench-send`) |
 | `--bench-compressible` | | `false` | Use compressible payload (bench) |
+| `--share` | | `false` | Print a `openflux://noise-v1/` client link and terminal QR, then exit |
 | `--version` | | | Print the CLI release version |
 | `--check-update` | | | Check GitHub Releases without installing |
 | `--self-update` | | | Download a verified binary, keep a rollback copy, and restart |
@@ -440,7 +441,14 @@ Release CLI clients check for updates on startup. The download is checked
 against the release asset size and SHA-256, and the old binary remains as a
 `*.bak` rollback copy. Network errors do not block startup. Exit nodes are
 updated through a controlled deployment. Build release binaries with
-`-ldflags="-X main.version=0.1.2"`; ordinary `dev` builds do not self-update.
+`-ldflags="-X main.version=0.1.3"`; ordinary `dev` builds do not self-update.
+
+To move a configuration to a phone, run `openflux --role=exit --transport=mailru
+--url="..." --exit-key-file=exit.key --share` with the existing exit key. The
+command prints a link and QR without connecting. Android scans the QR in the
+app; iOS can open the link from Camera. The URL may grant access to the
+transport, so keep the link private. PSK-protected exits are not supported by
+this import format.
 
 Deprecated (kept for one release, mapped automatically to the new flags):
 `--client`, `--exit-node`, `--tun`, `--socks5-mode`, `--legacy`,

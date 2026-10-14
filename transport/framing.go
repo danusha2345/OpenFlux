@@ -14,24 +14,15 @@ import (
 //	[1]   flags (bit0 = payload is zstd-compressed)
 //	[2:]  payload: a sequence of [2-byte big-endian length][packet] records,
 //	      optionally zstd-compressed as a whole.
+//
+// Only wire-v2 frames are accepted. The retired wire-v3 prototype is gone:
+// capability negotiation now lives in NegotiatedTransport (transport/negotiated.go),
+// inside the authenticated envelope.
 const (
 	batchFormatVersion = 0x02
 	batchFlagZstd      = 0x01
-
-	// maxPacketSize is the largest record a batch may carry: an IPv4 packet
-	// cannot be longer, and the 2-byte length prefix cannot say more.
-	maxPacketSize = 0xFFFF
-	// maxFrameBytes caps one encoded batch frame. The document transports
-	// prefix each frame with a 2-byte length and cap it at 65535, and the
-	// encrypted layer adds encryptedOverhead below the codec, so the batch
-	// itself must stay under 65535 - overhead.
-	encryptedOverhead = 64
-	maxFrameBytes     = 0xFFFF - encryptedOverhead
-	// maxBatchRecords and maxBatchDecoded bound what one frame from the
-	// shared document can make us allocate. Senders stay far below both
-	// (64 packets / 8 KB by default).
-	maxBatchRecords = 1024
-	maxBatchDecoded = 4 << 20
+	maxFrameBytes      = 1 << 20
+	maxFrameRecords    = 1024
 )
 
 var (
@@ -55,7 +46,7 @@ func init() {
 		zstd.WithDecoderConcurrency(1),
 		// Bound the damage from a malformed/hostile frame injected into the
 		// shared document: cap decompressed memory.
-		zstd.WithDecoderMaxMemory(maxBatchDecoded),
+		zstd.WithDecoderMaxMemory(8<<20),
 	)
 	if err != nil {
 		panic(fmt.Sprintf("zstd decoder init: %v", err))
@@ -78,8 +69,8 @@ func frameBatch(pkts [][]byte) []byte {
 	return out
 }
 
-// encodeBatch serializes packets into a single wire frame, compressing the
-// whole batch with zstd only when that actually shrinks it.
+// encodeBatch serializes packets into a single wire-v2 frame, compressing
+// the whole batch with zstd only when that actually shrinks it.
 func encodeBatch(pkts [][]byte) []byte {
 	framed := frameBatch(pkts)
 	compressed := zstdEnc.EncodeAll(framed, nil)
@@ -96,8 +87,19 @@ func encodeBatch(pkts [][]byte) []byte {
 	return append(out, framed...)
 }
 
+// EncodeBatchFrame serializes packets into a wire-v2 frame for transports that
+// carry the frame themselves instead of delegating to BatchedTransport - the
+// Telemost SFU path wraps each frame in a VP8 keyframe rather than passing it
+// up the transport stack. Such a transport must produce byte for byte what
+// BatchedTransport would have produced, or the receiving side rejects it.
+func EncodeBatchFrame(pkts [][]byte) []byte { return encodeBatch(pkts) }
+
 // decodeBatch reverses encodeBatch, returning the original packets.
+// Only wire-v2 frames are accepted; anything else is rejected.
 func decodeBatch(data []byte) ([][]byte, error) {
+	if len(data) > maxFrameBytes+2 {
+		return nil, fmt.Errorf("batch frame exceeds size limit")
+	}
 	if len(data) < 2 {
 		return nil, fmt.Errorf("batch frame too short: %d bytes", len(data))
 	}
@@ -105,6 +107,9 @@ func decodeBatch(data []byte) ([][]byte, error) {
 		return nil, fmt.Errorf("unknown batch version 0x%02x", data[0])
 	}
 	flags := data[1]
+	if flags & ^byte(batchFlagZstd) != 0 {
+		return nil, fmt.Errorf("unknown batch flags 0x%02x", flags)
+	}
 	payload := data[2:]
 
 	framed := payload
@@ -115,20 +120,20 @@ func decodeBatch(data []byte) ([][]byte, error) {
 			return nil, fmt.Errorf("zstd decode: %w", err)
 		}
 	}
+	if len(framed) > maxFrameBytes {
+		return nil, fmt.Errorf("decoded batch exceeds size limit")
+	}
 
 	var pkts [][]byte
 	for len(framed) > 0 {
+		if len(pkts) >= maxFrameRecords {
+			return nil, fmt.Errorf("batch exceeds record limit")
+		}
 		if len(framed) < 2 {
 			return nil, fmt.Errorf("truncated length prefix")
 		}
 		n := int(binary.BigEndian.Uint16(framed[:2]))
 		framed = framed[2:]
-		if n == 0 {
-			return nil, fmt.Errorf("empty packet record")
-		}
-		if len(pkts) == maxBatchRecords {
-			return nil, fmt.Errorf("batch has more than %d packets", maxBatchRecords)
-		}
 		if len(framed) < n {
 			return nil, fmt.Errorf("truncated packet: need %d, have %d", n, len(framed))
 		}

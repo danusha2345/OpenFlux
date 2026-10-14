@@ -5,33 +5,65 @@ import (
 	"testing"
 )
 
-func TestIPChecksumCoversOptions(t *testing.T) {
-	// IHL=6 (24-byte header: 20 + 4 bytes of options), TCP.
-	pkt := make([]byte, 24+20)
-	pkt[0] = 0x46 // version 4, IHL 6
-	pkt[9] = 6    // TCP
+func udpPacket(src, dst [4]byte, srcPort, dstPort uint16, payload []byte) []byte {
+	pkt := make([]byte, 20+8+len(payload))
+	pkt[0] = 0x45
 	binary.BigEndian.PutUint16(pkt[2:4], uint16(len(pkt)))
-	copy(pkt[12:16], []byte{10, 0, 0, 1})
-	copy(pkt[16:20], []byte{10, 0, 0, 2})
-	pkt[20], pkt[21], pkt[22], pkt[23] = 0x01, 0x01, 0x01, 0x00 // option bytes
+	pkt[8] = 64
+	pkt[9] = 17
+	copy(pkt[12:16], src[:])
+	copy(pkt[16:20], dst[:])
+	binary.BigEndian.PutUint16(pkt[20:22], srcPort)
+	binary.BigEndian.PutUint16(pkt[22:24], dstPort)
+	binary.BigEndian.PutUint16(pkt[24:26], uint16(8+len(payload)))
+	copy(pkt[28:], payload)
+	// Set a non-zero placeholder so fixChecksums enables the IPv4 UDP checksum.
+	pkt[26] = 0xff
+	pkt[27] = 0xff
 	fixChecksums(pkt)
-	if got := onesComplementSum(pkt[:24]); got != 0 {
-		t.Fatalf("IP checksum over full header not valid: verify sum = 0x%04x", got)
+	return pkt
+}
+
+func TestExtractUDPFlowKey(t *testing.T) {
+	pkt := udpPacket([4]byte{10, 10, 10, 2}, [4]byte{1, 1, 1, 1}, 53000, 53, []byte("query"))
+	k, ok := extractFlowKey(pkt)
+	if !ok {
+		t.Fatal("UDP flow was rejected")
+	}
+	if k.proto != 17 || k.srcPort != 53000 || k.dstPort != 53 {
+		t.Fatalf("unexpected flow key: %+v", k)
 	}
 }
 
-func TestIsFragmented(t *testing.T) {
-	pkt := make([]byte, 40)
-	pkt[0] = 0x45
-	if isFragmented(pkt) {
-		t.Fatal("unfragmented packet flagged")
+func TestUDPChecksumsAfterNATRewrite(t *testing.T) {
+	pkt := udpPacket([4]byte{10, 10, 10, 2}, [4]byte{8, 8, 8, 8}, 42000, 53, []byte("payload"))
+	rewriteSNAT(pkt, [4]byte{192, 0, 2, 10})
+	fixChecksums(pkt)
+	if got := onesComplementSum(pkt[:20]); got != 0 {
+		t.Fatalf("IPv4 checksum verification = %#04x, want 0", got)
 	}
-	pkt[6] = 0x20 // MF set
-	if !isFragmented(pkt) {
-		t.Fatal("MF fragment not detected")
+	var src, dst [4]byte
+	copy(src[:], pkt[12:16])
+	copy(dst[:], pkt[16:20])
+	if got := transportChecksum(pkt[20:], src, dst, 17); got != 0 {
+		t.Fatalf("UDP checksum verification = %#04x, want 0", got)
 	}
-	pkt[6], pkt[7] = 0x00, 0x25 // non-zero offset
-	if !isFragmented(pkt) {
-		t.Fatal("offset fragment not detected")
+}
+
+func TestFragmentedUDPIsRejected(t *testing.T) {
+	pkt := udpPacket([4]byte{10, 10, 10, 2}, [4]byte{1, 1, 1, 1}, 1000, 2000, nil)
+	binary.BigEndian.PutUint16(pkt[6:8], 0x2000)
+	if _, ok := extractFlowKey(pkt); ok {
+		t.Fatal("fragmented UDP packet unexpectedly produced a flow key")
+	}
+}
+
+func TestZeroUDPChecksumRemainsDisabled(t *testing.T) {
+	pkt := udpPacket([4]byte{10, 10, 10, 2}, [4]byte{1, 1, 1, 1}, 1000, 2000, nil)
+	pkt[26], pkt[27] = 0, 0
+	rewriteSNAT(pkt, [4]byte{192, 0, 2, 10})
+	fixChecksums(pkt)
+	if pkt[26] != 0 || pkt[27] != 0 {
+		t.Fatalf("zero UDP checksum changed to %02x%02x", pkt[26], pkt[27])
 	}
 }

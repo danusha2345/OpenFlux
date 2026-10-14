@@ -5,36 +5,35 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	godebug "runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 
-	"openflux/netguard"
-	"openflux/share"
-	"openflux/socks5"
-	"openflux/transport"
-	"openflux/transport/cupsonline"
-	"openflux/transport/mailru"
-	"openflux/transport/oneme"
-	"openflux/transport/yandex"
-	"openflux/tunnel"
-	"openflux/tunnel/l3"
-	"openflux/updater"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/netbind"
+	"github.com/p1neappleXpress/OpenFlux/netguard"
+	"github.com/p1neappleXpress/OpenFlux/socks5"
+	"github.com/p1neappleXpress/OpenFlux/streamproxy"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/control"
+	"github.com/p1neappleXpress/OpenFlux/transport/ipc"
+	"github.com/p1neappleXpress/OpenFlux/transport/manager"
+	"github.com/p1neappleXpress/OpenFlux/transport/phpbox"
+	"github.com/p1neappleXpress/OpenFlux/transport/registry"
+	"github.com/p1neappleXpress/OpenFlux/transport/script"
+	"github.com/p1neappleXpress/OpenFlux/tunnel"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
-
-// Set by release builds with -ldflags "-X main.version=0.1.2".
-var version = "dev"
 
 var (
 	globalDocUrl string
 	maxToken     string
 	maxUid       string
 	localIP      string
-	trafficEvery time.Duration
 )
 
 // expandShortFlags rewrites single-letter flag aliases into their long
@@ -50,10 +49,26 @@ func expandShortFlags(args []string) []string {
 		"-u": "--url",
 		"-s": "--socks5",
 		"-l": "--local-ip",
-		"-d": "--debug",
 	}
 	out := make([]string, 0, len(args))
-	for _, a := range args {
+	for i, a := range args {
+		// Counted debug flag: -d, -dd, -ddd -> --debug=1..3. Only a run of
+		// d's counts, so single-dash long flags like -direct-listen pass.
+		if n := debugCount(a); n > 0 {
+			out = append(out, fmt.Sprintf("--debug=%d", min(n, utils.LevelHexdump)))
+			continue
+		}
+		if strings.HasPrefix(a, "-d=") {
+			out = append(out, "--debug="+a[len("-d="):])
+			continue
+		}
+		// A bare --debug means -d, unless its level follows ("--debug 2").
+		if a == "--debug" || a == "-debug" {
+			if i+1 >= len(args) || !isNumber(args[i+1]) {
+				out = append(out, "--debug=1")
+				continue
+			}
+		}
 		replaced := false
 		for short, long := range aliases {
 			if a == short {
@@ -91,56 +106,230 @@ const (
 	codecLegacy  = "legacy"
 )
 
-func main() {
-	if len(os.Args) > 1 && os.Args[1] == "--complete-update" {
-		if err := updater.CompletePending(os.Args[2:]); err != nil {
-			log.Fatal(err)
+// transportHasCookies reports whether the given transport keeps state in the
+// cookie store: HTTP cookies that can be refreshed via the
+// NegotiatedTransport control channel, or - a script - what its setup page
+// was given (see sessionCookieKey).
+func transportHasCookies(t string) bool {
+	switch t {
+	case "yandex", "vyandex", "boards", "mailru", "cupsonline", "avito", "script":
+		return true
+	}
+	return false
+}
+
+func loadAvitoCookies(s string) string {
+	if strings.ContainsAny(s, "/\\.") {
+		data, err := os.ReadFile(s)
+		if err == nil {
+			var parts []string
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.Replace(line, "#HttpOnly_", "", 1)
+				if !strings.Contains(line, "\t") {
+					continue
+				}
+				fields := strings.Split(line, "\t")
+				if len(fields) >= 7 {
+					parts = append(parts, fields[5]+"="+fields[6])
+				}
+			}
+			if len(parts) > 0 {
+				return strings.Join(parts, "; ")
+			}
 		}
-		return
+	}
+	return s
+}
+
+// defaultCookieStorePath is the jar used without --cookie-store: one per
+// transport type in the current directory, and one per script - two scripts
+// must not share a jar. A script is named by --script-name, else by its
+// file.
+func defaultCookieStorePath(transportType, scriptName, scriptPath string) string {
+	if transportType == "script" {
+		name := scriptName
+		if name == "" && scriptPath != "" {
+			name = strings.TrimSuffix(filepath.Base(scriptPath), filepath.Ext(scriptPath))
+		}
+		name = strings.Map(func(r rune) rune {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+				return r
+			}
+			return '_'
+		}, name)
+		if name = strings.Trim(name, "."); name != "" {
+			return "./cookies-script-" + name + ".json"
+		}
+	}
+	return fmt.Sprintf("./cookies-%s.json", transportType)
+}
+
+// sessionCookieKey is cookieKey for a transport of a Session. A script
+// transport keeps what its setup page was given (a token, a pairing) in the
+// same store, so the user is not asked again at the next start; its key names
+// the script, because two scripts may share one URL.
+func sessionCookieKey(spec transportSpec, maxUid string) string {
+	if spec.Type == "script" {
+		name, _ := spec.Params["name"].(string)
+		return "script:" + name + " " + spec.URL
+	}
+	return cookieKey(spec.Type, spec.URL, maxUid)
+}
+
+// cookieKey identifies a session inside the cookie store. For most transports
+// this is the document URL; for oneme it would be maxUid, but oneme does not
+// use the store at all.
+func cookieKey(transportType, docURL, maxUid string) string {
+	switch transportType {
+	case "oneme":
+		return maxUid
+	default:
+		return docURL
+	}
+}
+
+// debugCount returns how many d's make up a -d, -dd, -ddd flag, or 0.
+func debugCount(a string) int {
+	if len(a) < 2 || a[0] != '-' || strings.Trim(a[1:], "d") != "" {
+		return 0
+	}
+	return len(a) - 1
+}
+
+func isNumber(s string) bool {
+	_, err := strconv.Atoi(s)
+	return err == nil
+}
+
+// contextSources describes the carriers for transport.KDFContexts, the one
+// rule every peer (CLI, Android, Desktop, iOS) derives the encryption
+// context with.
+func contextSources(specs []transportSpec) []transport.ContextSource {
+	out := make([]transport.ContextSource, len(specs))
+	for i, s := range specs {
+		out[i] = transport.ContextSource{Type: s.Type, URL: s.URL, Priority: s.Priority}
+	}
+	return out
+}
+
+// managerRefreshLoop periodically asks the exit node for a fresh cookie jar.
+// Runs on the client side only, when --transports or --negotiate is set.
+func managerRefreshLoop(m *manager.Manager) {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !m.IsConnected() {
+			continue
+		}
+		if err := m.SendControl(control.SubtypeCookiesRequest, nil); err != nil {
+			utils.Debugf("[CTRL] cookies request failed: %v", err)
+			continue
+		}
+		utils.Debugf("[CTRL] cookies request sent")
+	}
+}
+
+func main() {
+	// The desktop wizard's JSON protocol owns stdout: no banner, no flags.
+	if len(os.Args) == 2 && os.Args[1] == "--node-wizard" {
+		os.Exit(runNodeWizard(os.Stdin, os.Stdout))
+	}
+	// The core's own openflux:// parser and builder for apps and scripts,
+	// so a link is read and made the same way everywhere: JSON on stdout,
+	// before any banner.
+	if len(os.Args) == 3 && os.Args[1] == "--parse-link" {
+		os.Exit(runParseLink(os.Args[2], os.Stdin, os.Stdout))
+	}
+	if len(os.Args) == 3 && os.Args[1] == "--make-link" {
+		os.Exit(runMakeLink(os.Args[2], os.Stdin, os.Stdout))
+	}
+	// A downloaded script transport's trust report, for an app (desktop) that
+	// cannot call transport/script in-process the way the mobile gomobile
+	// bindings do: --inspect-script --data=<path> [--sig=<path>] [--pubkey=<hex>]
+	if len(os.Args) >= 2 && os.Args[1] == "--script-settings" {
+		os.Exit(runScriptSettings(os.Args[2:], os.Stdout))
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "--inspect-script" {
+		os.Exit(runInspectScript(os.Args[2:], os.Stdout))
+	}
+	// Updates of installed script transports, JSON reports on stdout; see
+	// script_cli.go. The apps decide only when to call them and what to say.
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "--check-script-update":
+			os.Exit(runCheckScriptUpdate(os.Args[2:], os.Stdout))
+		case "--apply-script-update":
+			os.Exit(runApplyScriptUpdate(os.Args[2:], os.Stdout))
+		case "--rollback-script":
+			os.Exit(runRollbackScript(os.Args[2:], os.Stdout))
+		}
 	}
 	fmt.Print("written by p1neappleXpress\n")
-	showVersion := flag.Bool("version", false, "Print the release version")
-	checkUpdate := flag.Bool("check-update", false, "Check GitHub Releases for a newer CLI")
-	selfUpdate := flag.Bool("self-update", false, "Install a verified CLI release and restart")
-	autoUpdate := flag.Bool("auto-update", true, "Client: install compatible CLI updates on startup")
-	shareFlag := flag.Bool("share", false, "Print a Noise client link and terminal QR from an existing exit key, then exit")
 
 	role := flag.String("role", roleClient, "client | exit | bench-send | bench-sink")
 	inbound := flag.String("inbound", "", "tun | socks5 (client only; default: tun on macOS, socks5 elsewhere)")
-	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, oneme, cupsonline, mailru)")
-	mode := flag.String("mode", "", "Exit-node mode: l3 (default, Linux only) or l4 (works everywhere)")
+	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, oneme, cupsonline, mailru, telemost)")
+	mode := flag.String("mode", "", "Exit-node mode: l3 (default; Linux as root, or Windows as Administrator with WinDivert) or l4 (works everywhere)")
 
 	codec := flag.String("codec", codecBatched, "batched (default, zstd+coalescing) or legacy (per-packet LZ4)")
-	exitKeyFile := flag.String("exit-key-file", "",
-		"Exit node: X25519 static key file for the encrypted transport, created on first run. "+
-			"The public key is printed at startup for clients")
-	peerKey := flag.String("peer-key", "",
-		"Client: the exit node's public key (from its startup banner). Turns the encrypted transport on")
-	allowPlaintext := flag.Bool("allow-plaintext", false,
-		"Run without encryption. UNSAFE: anyone with access to the document can read the traffic and use the exit node")
-	allowPrivate := flag.Bool("allow-private", false,
-		"Exit: allow reaching private/loopback/link-local networks and cloud metadata (169.254.169.254). Off by default")
-	pskFile := flag.String("psk-file", "",
-		"Optional, both peers: file with a shared secret (16+ characters). The exit node then refuses clients without it")
-	yandexCookiesFile := flag.String("yandex-cookies-file", "", "Netscape cookies.txt for manual Yandex browser verification")
-	yandexChallengeFile := flag.String("yandex-challenge-file", "", "Private file where a Yandex challenge URL is saved for manual opening")
+	negotiate := flag.Bool("negotiate", false, "Require encrypted, session-bound IPv4 capability negotiation on both peers (no legacy fallback)")
+	maxPacket := flag.Int("max-packet-size", transport.MaxNegotiatedPacket, "Maximum IPv4 packet in negotiated mode (1280..65000); not the Internet path MTU")
+	cookieStorePath := flag.String("cookie-store", "",
+		"Path to the cookie jar file. Default: ./cookies-<transport>.json in the current directory "+
+			"(./cookies-script-<name>.json for a script). "+
+			"Ignored for transports without cookies (direct, oneme).")
+	encryptionKeyFile := flag.String("encryption-key-file", "",
+		"Optional: encrypt the transport with AES-256-GCM using a shared secret read from this file. "+
+			"Both peers must use the same secret; unset means unencrypted, unchanged behavior")
+	sessionContextFlag := flag.String("session-context", "",
+		"Explicit KDF context for --encryption-key-file. Both peers must use the same value. "+
+			"Default: derived from the document URL (--url, any --<type>-url, or [Transport] URL "+
+			"from --config), falling back to --transport. Only set this to override that derivation.")
 
-	flag.StringVar(&globalDocUrl, "url", "http://#",
-		"Document URL. A comma-separated list (yandex, vyandex) runs the tunnel over several documents at once")
-	statusEvery := flag.Duration("multistream-status", 0,
-		"With several --url documents: log per-document state on this interval (e.g. 10s)")
-	trafficInterval := flag.Duration("traffic-stats", 0,
-		"Emit machine-readable cumulative transport traffic on this interval (e.g. 1s)")
+	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
 	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
 	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
-	socksAddr := flag.String("socks5", "127.0.0.1:1080", "SOCKS5 listen address (loopback by default; no authentication, so avoid exposing it)")
+	directDial := flag.String("direct-dial", "", "DirectTransport: exit address to dial (client). Requires --encryption-key-file")
+	directListen := flag.String("direct-listen", "", "DirectTransport: local address to listen on (exit). Requires --encryption-key-file")
+	transportsFlag := flag.String("transports", "",
+		"Comma-separated list of transports with priorities, e.g. "+
+			"\"direct:100,yandex:50\". If empty, --transport is used as a single transport.")
+	yandexURL := flag.String("yandex-url", "", "URL for the yandex transport (overrides --url in --transports mode)")
+	vyandexURL := flag.String("vyandex-url", "", "URL for the vyandex transport")
+	flag.StringVar(&yandexCookiesFile, "yandex-cookies-file", "", "Netscape cookies.txt with a Yandex login for vyandex transports")
+	boardsURL := flag.String("boards-url", "", "URL for the boards transport")
+	mailruURL := flag.String("mailru-url", "", "URL (weblink) for the mailru transport")
+	cupsonlineURL := flag.String("cupsonline-url", "", "URL for the cupsonline transport")
+	avitoURL := flag.String("avito-url", "", "URL for the avito transport")
+	avitoCookies := flag.String("avito-cookies", "", "Raw cookie string for code.avito.ru (or path to Netscape cookies.txt)")
+	onemeToken := flag.String("oneme-token", "", "MAX token for the oneme transport")
+	onemeUID := flag.String("oneme-uid", "", "MAX uid for the oneme transport")
+	scriptPath := flag.String("script-path", "", "Path to the script transport's <name>.flux or <name>.js (needs <name>.js.sig beside a bare .js)")
+	scriptPubkey := flag.String("script-pubkey", "", "Hex-encoded ed25519 public key the script transport's signature is checked against")
+	scriptName := flag.String("script-name", "", "Carrier name for the script transport (default: the name in its own info())")
+	scriptAutoUpdate := flag.Bool("script-auto-update", false, "Node: keep .flux transports current and self-heal (check/apply auto-OK updates, roll back, hot-swap without a restart)")
+	scriptUpdateChannel := flag.String("script-update-channel", "stable", "Node: update channel for --script-auto-update (stable | nightly)")
+	configPath := flag.String("config", "",
+		"Path to an OpenFlux .conf file. Command-line flags override values from the file.")
+	shareFlag := flag.Bool("share", false,
+		"Exit: print an openflux:// link and QR code that clients scan to connect (contains the encryption key)")
+	shareHost := flag.String("share-host", "",
+		"Exit: address clients dial for direct in the --share link. Default: this host's first public IPv4")
+	ipcSocketPath := flag.String("ipc-socket", "",
+		"Path to the Unix domain socket used by the mobile app to talk to the core. "+
+			"Empty = no IPC server.")
+	allowPrivate := flag.Bool("allow-private", false, "Exit: allow private/link-local destinations")
+	socksAddr := flag.String("socks5", "127.0.0.1:1080", "SOCKS5 address")
+	httpProxyAddr := flag.String("http-proxy", "", "Client: also serve an HTTP proxy (CONNECT and plain requests) on this address, through the same tunnel")
 	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (l3 mode only, scoped RST drop)")
-	upstreamProxy := flag.String("upstream-proxy", "", "Upstream SOCKS5 proxy for exit node (e.g. 127.0.0.1:10808, socks5://127.0.0.1:10808, or 'direct')")
 
 	benchBytes := flag.Int("bench-bytes", 0, "Benchmark: push this many MB through the transport, then report and exit")
 	benchCompressible := flag.Bool("bench-compressible", false, "Benchmark: use compressible payload instead of random")
 
-	debug := flag.Bool("debug", false, "Enable verbose debug logging")
+	debug := flag.Int("debug", 0, "Debug level: 1 packets (-d), 2 operational logs (-dd), 3 hexdumps (-ddd)")
+	sensitive := flag.Bool("sensitive", false, "Also log key material and, with -ddd, plaintext frames (cookie jars, tokens)")
+	sensitiveAlias := flag.Bool("sensetive", false, "Alias for --sensitive")
 
 	// Deprecated aliases, kept for one release to ease migration.
 	depClient := flag.Bool("client", false, "DEPRECATED: use --role=client")
@@ -150,7 +339,6 @@ func main() {
 	depLegacy := flag.Bool("legacy", false, "DEPRECATED: use --codec=legacy")
 	depBenchSend := flag.Int("bench-send", 0, "DEPRECATED: use --role=bench-send --bench-bytes=N")
 	depBenchSink := flag.Bool("bench-sink", false, "DEPRECATED: use --role=bench-sink")
-	depEncryptionKeyFile := flag.String("encryption-key-file", "", "DEPRECATED: use --psk-file with --exit-key-file / --peer-key")
 
 	// Override the default flag.PrintDefaults so -h prints a structured
 	// usage message with axes, modifiers, and examples instead of a flat
@@ -160,6 +348,8 @@ func main() {
 
 USAGE
   openflux --role=<role> --transport=<type> [OPTIONS]
+  openflux --role=<role> --transports=<list> [OPTIONS]
+  openflux --config=/path/to/openflux.conf [OPTIONS]
 
 ROLE
   -r, --role=client       Run as client. (default)
@@ -167,91 +357,234 @@ ROLE
   -r, --role=bench-send   Benchmark: push --bench-bytes MB.
   -r, --role=bench-sink   Benchmark: receive from transport.
 
-TRANSPORT
+TRANSPORT  (single-transport mode)
   -t, --transport=yandex       Yandex.Docs over WebSocket. (default)
   -t, --transport=vyandex      Yandex.Volga over HTTP relay + WS.
   -t, --transport=oneme        MAX (VK) over WebRTC.
   -t, --transport=cupsonline   Cups.online interview rooms.
+  -t, --transport=avito        code.avito.ru ShareDB rooms.
+  -t, --transport=telemost     Yandex Telemost conference (--url <link>), striped over several participants.
   -t, --transport=mailru       Mail.ru Docs over WebSocket.
+  -t, --transport=direct       Plain TCP to a self-hosted exit.
+  -t, --transport=script       A signed JS (goja) transport. Session only
+                               (needs --encryption-key-file): see --script-*.
+  -u, --url=<URL>              Document URL.
 
-  -u, --url=<URL>[,<URL>...]   Document URL. Several (yandex, vyandex): multi-stream,
-                               each connection pinned to one document, failover
-                               to the others. Both peers list the same documents.
-      --multistream-status=<d> Log per-document state every <d> (e.g. 10s).
-      --maxToken=<token>       MAX auth token (--transport=oneme).
-      --maxUid=<uid>           MAX user id   (--transport=oneme).
+TRANSPORTS  (multi-transport session; requires --encryption-key-file)
+      --transports=direct:100,yandex:50
+                               Comma-separated list of transports with
+                               priorities. Higher priority = tried first
+                               for the handshake and for control traffic.
+                               All listed transports are attached to one
+                               Session; IPv4 flows are hashed across them.
+      --yandex-url=<URL>       URL for the yandex transport.
+      --vyandex-url=<URL>      URL for the vyandex transport.
+      --yandex-cookies-file=<path>
+                               Netscape cookies.txt with a Yandex login for
+                               vyandex transports.
+      --boards-url=<URL>       URL for the boards transport.
+      --mailru-url=<WEBLINK>   Weblink for the mailru transport.
+      --cupsonline-url=<URL>   URL for the cupsonline transport.
+      --avito-url=<URL>        URL for the avito transport.
+      --avito-cookies=<str>    Raw cookie string or path to Netscape
+                               cookies.txt for code.avito.ru.
+      --oneme-token=<token>    MAX auth token for the oneme transport.
+      --oneme-uid=<uid>        MAX user id for the oneme transport.
+      --direct-dial=<addr>     DirectTransport: exit host:port (client).
+      --direct-listen=<addr>   DirectTransport: listen addr on exit.
+      --script-path=<path>     Script transport: path to <name>.flux or
+                               <name>.js (needs <name>.js.sig beside a bare
+                               .js). Also used with --transport=script.
+      --script-pubkey=<hex>    Script transport: author's ed25519 public key.
+      --script-name=<name>     Script transport: carrier name (default: the
+                               name the script's own info() reports).
 
 INBOUND  (only with --role=client)
-  -i, --inbound=tun            utun (macOS) / NEPacketTunnel (iOS). Default on macOS.
+  -i, --inbound=tun            utun (macOS) / Wintun (Windows, needs administrator
+                               and wintun.dll next to the binary) / NEPacketTunnel
+                               (iOS). Default on macOS.
   -i, --inbound=socks5         SOCKS5 + gVisor. Default on other platforms.
   -s, --socks5=<addr>          SOCKS5 listen address (default 127.0.0.1:1080).
+      --http-proxy=<addr>      Also serve an HTTP proxy (CONNECT and plain
+                               requests) on this address, e.g. for a system
+                               proxy that only speaks HTTP.
 
 MODE  (only with --role=exit)
-  -m, --mode=l3                Packet forwarding (SNAT/DNAT). Default.
+  -m, --mode=l3                Packet forwarding (SNAT/DNAT). Default. Linux
+                               as root; Windows as Administrator with
+                               WinDivert.dll + WinDivert64.sys beside the core.
   -m, --mode=l4                Stream proxy (TCP termination + re-dial).
   -l, --local-ip=<ip>          Egress IP for SNAT. Auto-detected.
-      --upstream-proxy=<addr>  Upstream SOCKS5 proxy for exit node (forces l4 mode,
-                               e.g. 127.0.0.1:10808, socks5://127.0.0.1:10808, or direct).
-                               Auto-detected from -s/--socks5 if specified with --role=exit.
 
 TRANSPORT MODIFIERS
   -c, --codec=batched          zstd + coalescing. Default.
   -c, --codec=legacy           Per-packet LZ4. A/B only.
-
-YANDEX BROWSER VERIFICATION
-      --yandex-challenge-file=<path>  Save a challenge URL privately for manual opening.
-      --yandex-cookies-file=<path>    Reload a Netscape cookies.txt (mode 0600)
-                                      after the browser has passed the check.
-
-ENCRYPTION  (Noise NKpsk0: X25519 + AES-256-GCM, session keys rotate every 2 min)
-      --exit-key-file=<path>   Exit: static key file, created on first run. The public
-                               key is printed at startup; give it to clients.
-      --peer-key=<base64>      Client: the exit node's public key. Turns encryption on.
-      --psk-file=<path>        Both, optional: shared secret (16+ chars). The exit then
-                               refuses clients that do not have it.
-      --allow-plaintext        Run without encryption (unsafe; encryption is required
-                               otherwise).
-      --allow-private          Exit: permit private/loopback/link-local and cloud-metadata
-                               destinations (blocked by default).
+      --encryption-key-file=<path>
+                               AES-256-GCM wrapper. Required with
+                               --transports or --negotiate. Both peers
+                               must share the same key.
+      --session-context=<str>  Explicit KDF context for that key. Both peers
+                               must use the same value. Default: --url, else
+                               the URL of the highest-priority transport,
+                               else "http://#".
+      --negotiate              Require authenticated capability negotiation
+                               on both peers. No legacy fallback.
+      --max-packet-size=N      Max IPv4 packet in negotiated mode
+                               (1280..65000). Default 65000.
+      --cookie-store=<path>    Cookie jar file. Default: ./cookies-<transport>.json
+                               (./cookies-script-<name>.json for a script).
+      --ipc-socket=<path>      Unix domain socket for the mobile bridge.
+                               Empty = no IPC server.
+      --share                  Exit: print an openflux:// link and QR code for
+                               clients to scan. Contains the encryption key.
+      --share-host=<host>      Exit: address clients dial for direct in the
+                               link. Default: this host's first public IPv4.
+      --config=<path>          Load settings from an OpenFlux .conf file
+                               (INI-like, similar to wg-quick). Command-line
+                               flags override values from the file.
 
 BENCHMARK  (only with --role=bench-*)
       --bench-bytes=<MB>       MB to push (bench-send).
       --bench-compressible     Repetitive payload (bench-send).
 
 LOGGING
-  -d, --debug                  Verbose per-packet logging.
-
-UPDATES  (CLI clients; servers update through a controlled deployment)
-      --version                Print the release version.
-      --check-update           Check for a newer release without installing it.
-      --self-update            Verify and install a newer CLI release.
-      --auto-update=false      Disable the startup update check on clients.
-
-SHARE
-      --share                  Exit: print a Noise client link and QR, then exit.
-                               Uses an existing --exit-key-file and --url.
+  -d, --debug=1                Packet movement: one line per IPv4 packet,
+                               "-> 52 bytes - UDP 10.10.10.2:53000 -> 8.8.8.8:53 ...".
+  -dd, --debug=2               Plus operational logs: sessions, carriers,
+                               handshakes, crypto, control, errors.
+  -ddd, --debug=3              Plus hexdumps of packets and ciphertext.
+      --sensitive              Also log key material and, with -ddd, the
+                               plaintext frames (control messages carry
+                               cookie jars and tokens). Off by default.
 
 DEPRECATED (removed in v2)
   -client, -exit-node      -> --role=client|exit
   -tun, -socks5-mode       -> --inbound=tun|socks5
   -legacy                  -> --codec=legacy
   -bench-send, -bench-sink -> --role=bench-send|bench-sink
-  -encryption-key-file     -> --psk-file (plus --exit-key-file / --peer-key)
 `)
 	}
 
 	os.Args = expandShortFlags(os.Args)
 	flag.Parse()
-	trafficEvery = *trafficInterval
-	if *showVersion {
-		fmt.Println(version)
-		return
-	}
-	if *checkUpdate || *selfUpdate {
-		if runUpdate(*selfUpdate, false) {
-			return
+	netguard.SetAllowPrivate(*allowPrivate)
+
+	// OPENFLUX_DNS overrides DNS resolution to a specific nameserver (e.g.
+	// "8.8.8.8:53"). Needed for the CLI on Android, where a static (CGO-off)
+	// binary has no usable /etc/resolv.conf and Go falls back to [::1]:53.
+	if dns := os.Getenv("OPENFLUX_DNS"); dns != "" {
+		if !strings.Contains(dns, ":") {
+			dns += ":53"
 		}
-		return
+		net.DefaultResolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				d := net.Dialer{Timeout: 5 * time.Second}
+				if network == "tcp" || network == "tcp4" || network == "tcp6" {
+					return d.DialContext(ctx, "tcp", dns)
+				}
+				return d.DialContext(ctx, "udp", dns)
+			},
+		}
+	}
+
+	// isExit is the session/encryption-directionality role: which side of a
+	// negotiated or encrypted pair this process plays. bench-sink is the
+	// passive, always-listening side (like an exit), bench-send the active
+	// initiator (like a client) - without this, two bench processes both
+	// resolved to "client", so a negotiated session never had an exit side
+	// to answer hellos with a challenge, and two peers' encryption keys
+	// were derived in the same direction instead of swapped.
+	isExit := *role == roleExit || *role == roleBenchSink
+
+	// Apply .conf file if requested. Only flags that were not explicitly set
+	// on the command line are overridden.
+	//
+	// confTransports is declared at function scope (not inside the if) so
+	// pickSessionContext can see it below: a .conf-only deployment has no
+	// --url/--yandex-url and its document URL lives in the [Transport]
+	// sections, which must still contribute to the KDF context.
+	var confTransports []transportSpec
+	if *configPath != "" {
+		conf, err := parseConf(*configPath)
+		if err != nil {
+			log.Fatalf("--config: %v", err)
+		}
+		setFlags := make(map[string]bool)
+		flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+
+		applyConfString(conf.Interface, "Role", "role", role, setFlags)
+		// Role may have just changed: isExit above was computed from the
+		// pre-.conf value, so a config-only "Role = exit" (no --role on the
+		// command line, as every node-wizard deployment runs) left isExit
+		// stuck at false. Recompute before it's used below.
+		isExit = *role == roleExit || *role == roleBenchSink
+		applyConfString(conf.Interface, "Inbound", "inbound", inbound, setFlags)
+		applyConfString(conf.Interface, "Transport", "transport", transportType, setFlags)
+		applyConfString(conf.Interface, "Mode", "mode", mode, setFlags)
+		applyConfString(conf.Interface, "Codec", "codec", codec, setFlags)
+		applyConfString(conf.Interface, "Socks5", "socks5", socksAddr, setFlags)
+		applyConfString(conf.Interface, "EncryptionKeyFile", "encryption-key-file", encryptionKeyFile, setFlags)
+		applyConfString(conf.Interface, "SessionContext", "session-context", sessionContextFlag, setFlags)
+		applyConfString(conf.Interface, "CookieStore", "cookie-store", cookieStorePath, setFlags)
+		applyConfString(conf.Interface, "IPCSocket", "ipc-socket", ipcSocketPath, setFlags)
+		applyConfString(conf.Interface, "URL", "url", &globalDocUrl, setFlags)
+		if v, ok := confValue(conf.Interface, "Debug"); ok && !setFlags["debug"] {
+			if b, err := strconv.Atoi(v); err == nil {
+				*debug = b
+			} else if confBool(v, false) {
+				*debug = 1
+			}
+		}
+		if v, ok := confValue(conf.Interface, "Sensitive"); ok && !setFlags["sensitive"] && !setFlags["sensetive"] {
+			*sensitive = confBool(v, *sensitive)
+		}
+
+		for _, t := range conf.Transports {
+			if t.Name == "" {
+				continue
+			}
+			spec := transportSpec{
+				Name:     t.Name,
+				Type:     t.Values["Type"],
+				Priority: confInt(t.Values["Priority"], 50),
+				URL:      t.Values["URL"],
+			}
+			if spec.Type == "" {
+				spec.Type = t.Name
+			}
+			if spec.Type == "direct" {
+				spec.Params = map[string]interface{}{
+					"dial":    t.Values["Dial"],
+					"listen":  t.Values["Listen"],
+					"is_exit": isExit,
+				}
+			}
+			if spec.Type == "oneme" {
+				spec.Params = map[string]interface{}{
+					"token": t.Values["Token"],
+					"uid":   t.Values["UID"],
+					"exit":  isExit,
+				}
+			}
+			if spec.Type == "script" {
+				spec.Params = map[string]interface{}{
+					"path":   t.Values["Path"],
+					"pubkey": t.Values["Pubkey"],
+					"name":   t.Values["Name"],
+				}
+				// Settings the user saved in the script's wizard: one encoded line, because
+				// a .conf value ends at '#' or ';' and a setting may hold either.
+				if enc := t.Values["Params"]; enc != "" {
+					settings, err := script.DecodeSettings(enc)
+					if err != nil {
+						log.Fatalf("--config: [Transport %s] Params: %v", t.Name, err)
+					}
+					spec.Params["settings"] = settings
+				}
+			}
+			confTransports = append(confTransports, spec)
+		}
 	}
 
 	// Map deprecated flags to their new counterparts. New flags win over
@@ -293,35 +626,12 @@ DEPRECATED (removed in v2)
 		log.Printf("warning: -bench-sink is deprecated, use --role=bench-sink")
 		*role = roleBenchSink
 	}
-	if *depEncryptionKeyFile != "" && *pskFile == "" {
-		log.Printf("warning: -encryption-key-file is deprecated, use --psk-file; " +
-			"the encrypted transport now also needs --exit-key-file on the exit node and --peer-key on the client")
-		*pskFile = *depEncryptionKeyFile
-	}
-	if *shareFlag {
-		cfg, err := buildShare(*role, *transportType, globalDocUrl, *exitKeyFile, *pskFile, *codec)
-		if err != nil {
-			log.Fatalf("--share: %v", err)
-		}
-		link, err := share.Encode(cfg)
-		if err != nil {
-			log.Fatalf("--share: %v", err)
-		}
-		qr, err := share.Terminal(link)
-		if err != nil {
-			log.Fatalf("--share: %v", err)
-		}
-		fmt.Println("Noise client link (the document/room URL may grant access):")
-		fmt.Println(link)
-		fmt.Fprint(os.Stderr, qr)
-		return
-	}
-	if *autoUpdate && *role == roleClient && runtime.GOOS != "android" && version != "dev" && runUpdate(true, true) {
-		return
-	}
 
 	// Platform defaults. The recommended client path is utun on macOS and
-	// SOCKS5 everywhere else (see README for details).
+	// SOCKS5 everywhere else (see README for details). Stream mode keeps
+	// SOCKS5 unless the full tunnel is asked for by name: it was a proxy
+	// first, and the apps' proxy profiles do not pass --inbound.
+	inboundChosen := *inbound != ""
 	if *inbound == "" {
 		if runtime.GOOS == "darwin" {
 			*inbound = inboundTUN
@@ -331,27 +641,6 @@ DEPRECATED (removed in v2)
 	}
 	if *mode == "" {
 		*mode = "l3"
-	}
-
-	if *role == roleExit && *upstreamProxy == "" {
-		socks5Explicit := false
-		flag.Visit(func(f *flag.Flag) {
-			if f.Name == "socks5" {
-				socks5Explicit = true
-			}
-		})
-		if socks5Explicit && *socksAddr != "" {
-			*upstreamProxy = *socksAddr
-		}
-	}
-
-	if *role == roleExit && *upstreamProxy != "" {
-		if *mode == "" || *mode == "l3" {
-			if *mode == "l3" {
-				log.Printf("info: upstream proxy requires l4 mode, switching from l3 to l4")
-			}
-			*mode = "l4"
-		}
 	}
 
 	if *codec != codecBatched && *codec != codecLegacy {
@@ -373,23 +662,45 @@ DEPRECATED (removed in v2)
 		log.Fatalf("unknown --role=%q (want client|exit|bench-send|bench-sink)", *role)
 	}
 
-	// Warn when the exit runs on l4 (gVisor): it works everywhere but is
-	// slower than l3 (SNAT/DNAT, Linux only, needs root + iptables).
-	if *role == roleExit && *mode == "l4" {
-		log.Printf("warning: exit on l4 (gVisor). l3 is faster on Linux with root.")
+	// Windows full tunnel: bind the core's sockets to the real interface
+	// before any transport dials, so the carriers stay out of the tunnel
+	// once it takes the default route (see package netbind).
+	if *role == roleClient && *inbound == inboundTUN && runtime.GOOS == "windows" {
+		index, err := netbind.BindDefault()
+		if err != nil {
+			log.Fatalf("tun: %v", err)
+		}
+		log.Printf("core sockets bound to interface %d", index)
 	}
 
-	netguard.SetAllowPrivate(*allowPrivate)
-	if *allowPrivate && *role == roleExit {
-		log.Printf("WARNING: --allow-private: the exit node may reach private networks and cloud metadata")
+	// Warn when the exit runs on l4 (gVisor): it works everywhere but is
+	// slower than l3 (SNAT/DNAT: Linux as root, Windows with WinDivert).
+	if *role == roleExit && *mode == "l4" {
+		log.Printf("warning: exit on l4 (gVisor). l3 is faster: Linux as root, Windows as Administrator.")
+	}
+
+	// --mode=stream: the client speaks the phpbox stream mux (OPEN/DATA/CLOSE
+	// frames) over the transport instead of IP packets through gVisor, and a
+	// local SOCKS5 hands each app connection to a mux stream. The exit is a
+	// phpbox exit (deploy/phpbox over cups). This is a circuit-level TCP
+	// tunnel, not L7 - the exit never parses the application protocol.
+	// The debug level is set here, not only further down: this branch returns before that code runs.
+	if *role == roleClient && *mode == "stream" {
+		utils.SetLevel(*debug)
+		if *sensitive || *sensitiveAlias {
+			utils.SetSensitive(true)
+		}
+		if *inbound == inboundTUN && inboundChosen {
+			runStreamTUN(*transportType, globalDocUrl)
+			return
+		}
+		runStreamClient(*transportType, globalDocUrl, *socksAddr, *httpProxyAddr, *ipcSocketPath)
+		return
 	}
 
 	exitMode, err := tunnel.ParseExitMode(*mode)
 	if err != nil {
 		log.Fatalf("--mode: %v", err)
-	}
-	if localIP != "" {
-		l3.SetLocalIP(localIP)
 	}
 
 	// The exit node often runs on a tiny VPS; keep the heap tight under load
@@ -398,13 +709,30 @@ DEPRECATED (removed in v2)
 		godebug.SetGCPercent(20)
 	}
 
-	if *debug {
-		utils.EnableDebug()
+	utils.SetLevel(*debug)
+	if *sensitive || *sensitiveAlias {
+		utils.SetSensitive(true)
 	}
+	utils.Debugf("[INIT] debug level=%d sensitive=%v", utils.Level(), utils.Sensitive())
 
-	log.Printf("=== Universal Bypass Tool ===")
+	log.Printf("=== OpenFlux ===")
 	log.Printf("Role: %s", *role)
-	log.Printf("Transport: %s", *transportType)
+	// A .conf's [Transport ...] sections or --transports run a Session of
+	// several carriers; *transportType stays at its flag default ("yandex")
+	// in both cases, so printing it unconditionally here always claimed
+	// "yandex" regardless of what was actually configured.
+	switch {
+	case len(confTransports) > 0:
+		names := make([]string, len(confTransports))
+		for i, t := range confTransports {
+			names[i] = t.Type
+		}
+		log.Printf("Transport: %s (session)", strings.Join(names, ", "))
+	case *transportsFlag != "":
+		log.Printf("Transport: %s (session)", *transportsFlag)
+	default:
+		log.Printf("Transport: %s", *transportType)
+	}
 	if *role == roleClient {
 		log.Printf("Inbound: %s", *inbound)
 	}
@@ -414,49 +742,344 @@ DEPRECATED (removed in v2)
 
 	config := transport.DefaultConfig()
 
-	// Optional encryption sits directly on the raw transport: the codec above
-	// it batches and compresses plaintext, and one AEAD covers a whole batch.
-	// The client (and bench-send) initiates handshakes, the exit node (and
-	// bench-sink) answers them. Every document stream gets its own session.
-	var psk string
-	if *pskFile != "" {
-		secret, err := readSecretFile(*pskFile)
-		if err != nil {
-			log.Fatalf("--psk-file: %v", err)
+	// Cookie store: per-transport file in pwd, unless --cookie-store is set.
+	// Transports without cookies (direct, oneme) skip it entirely.
+	var store *transport.CookieStore
+	if transportHasCookies(*transportType) {
+		path := *cookieStorePath
+		if path == "" {
+			path = defaultCookieStorePath(*transportType, *scriptName, *scriptPath)
 		}
-		psk = secret
+		s, err := transport.NewCookieStore(path)
+		if err != nil {
+			log.Fatalf("Cookie store %s: %v", path, err)
+		}
+		store = s
+		log.Printf("Cookie store: %s", path)
 	}
-	initiator := *role == roleClient || *role == roleBenchSend
-	enc, err := newEncryptionSetup(encryptionOptions{
-		ExitKeyFile: *exitKeyFile, PeerKey: *peerKey, PSK: psk, AllowPlaintext: *allowPlaintext,
-	}, initiator)
-	if err != nil {
-		log.Fatalf("Encryption: %v", err)
+
+	// Avito cookies: load from file or use as raw string.
+	if *avitoCookies != "" {
+		avitoCookiesStr = loadAvitoCookies(*avitoCookies)
 	}
-	if enc == nil {
-		log.Printf("WARNING: --allow-plaintext: the tunnel is NOT encrypted or authenticated")
+
+	// Build the list of transports to run. Two modes:
+	//   --transports=direct:100,yandex:50  -> multi-transport session
+	//   --transport=<type>                 -> legacy single-transport mode
+	var specs []transportSpec
+	// Running transports whose client address (cupsonline rooms) exists only
+	// once they start, by spec name, for --share.
+	rooms := make(map[string]roomLister)
+	if len(confTransports) > 0 {
+		specs = confTransports
+		// Per-type URL flags still override config values.
+		urls := map[string]string{
+			"yandex":     *yandexURL,
+			"vyandex":    *vyandexURL,
+			"boards":     *boardsURL,
+			"mailru":     *mailruURL,
+			"cupsonline": *cupsonlineURL,
+			"avito":      *avitoURL,
+		}
+		specs = buildTransportSpecs(specs, urls, nil)
+	} else if *transportsFlag != "" {
+		parsed, err := parseTransportList(*transportsFlag)
+		if err != nil {
+			log.Fatalf("--transports: %v", err)
+		}
+		urls := map[string]string{
+			"yandex":     *yandexURL,
+			"vyandex":    *vyandexURL,
+			"boards":     *boardsURL,
+			"mailru":     *mailruURL,
+			"cupsonline": *cupsonlineURL,
+			"avito":      *avitoURL,
+		}
+		if globalDocUrl != "" && globalDocUrl != "http://#" && urls["yandex"] == "" {
+			urls["yandex"] = globalDocUrl
+		}
+		extra := map[string]map[string]interface{}{
+			"oneme": {"token": *onemeToken, "uid": *onemeUID, "exit": isExit},
+			"direct": {
+				"dial":    *directDial,
+				"listen":  *directListen,
+				"is_exit": isExit,
+			},
+			"script": {"path": *scriptPath, "pubkey": *scriptPubkey, "name": *scriptName},
+		}
+		specs = buildTransportSpecs(parsed, urls, extra)
 	} else {
-		log.Printf("Transport encryption: %s", enc.label)
-		fmt.Print(enc.banner)
+		// Named after the type, as --transports and the apps name
+		// carriers: cookie exchange with a Session peer is by name.
+		specs = []transportSpec{{
+			Name:     *transportType,
+			Type:     *transportType,
+			Priority: 100,
+			URL:      globalDocUrl,
+		}}
+		if *transportType == "oneme" {
+			specs[0].Params = map[string]interface{}{
+				"token": maxToken, "uid": maxUid, "exit": isExit,
+			}
+		}
+		if *transportType == "direct" {
+			specs[0].Params = map[string]interface{}{
+				"dial": *directDial, "listen": *directListen, "is_exit": isExit,
+			}
+		}
+		if *transportType == "script" {
+			specs[0].Params = map[string]interface{}{
+				"path": *scriptPath, "pubkey": *scriptPubkey, "name": *scriptName,
+			}
+		}
 	}
 
-	switch *codec {
-	case codecBatched:
-		log.Printf("Codec: batched (zstd + coalescing)")
-	case codecLegacy:
-		log.Printf("Codec: legacy (per-packet LZ4, no batching)")
+	// Telemost's media runs over WebRTC's own UDP sockets, which neither the
+	// macOS bypass routes (TCP only) nor the Windows interface binding cover:
+	// under the full tunnel they would loop into the tunnel they carry.
+	if *role == roleClient && *inbound == inboundTUN && hasTelemost(specs) {
+		log.Fatalf("Telemost does not work under --inbound=tun yet: use --inbound=socks5 (the apps' proxy mode)")
 	}
 
-	urls := splitURLs(globalDocUrl)
-	if len(urls) > 1 && !supportsMultiStream(*transportType) {
-		log.Fatalf("--url: several documents are supported with --transport=yandex or vyandex, not %s", *transportType)
+	// Validate --codec with the multi-transport path. Session always uses
+	// BatchedTransport, so --codec=legacy is only valid in single-transport
+	// non-negotiated mode.
+	if *negotiate && *codec != codecBatched {
+		log.Fatal("--negotiate requires --codec=batched")
 	}
 
-	// Every document gets a complete stream of its own (transport, encryption,
-	// codec), so each carries exactly the single-document wire format.
-	trans := newDocStreams(urls, func(docURL string) transport.Transport {
-		return newStream(*transportType, docURL, *role, *codec, enc, config, *yandexCookiesFile, *yandexChallengeFile)
-	})
+	// Encryption secret is mandatory when --negotiate is set.
+	//
+	// The session context is the KDF salt for the encryption keys and MUST
+	// be identical on both peers; see pickSessionContext.
+	var secret string
+	var sessionContext string
+	if *encryptionKeyFile != "" {
+		b, err := os.ReadFile(*encryptionKeyFile)
+		if err != nil {
+			log.Fatalf("Read encryption key file: %v", err)
+		}
+		secret = strings.TrimSpace(string(b))
+		if n := utils.SecretChars(secret); n < utils.MinSecretChars {
+			log.Fatalf("Encryption key from %s is too short (%d chars, need at least %d)",
+				*encryptionKeyFile, n, utils.MinSecretChars)
+		}
+		if strings.ContainsAny(secret, "\r\n\t") {
+			utils.Debugf("[KEY] WARNING: secret still contains whitespace after TrimSpace; lengths may differ across platforms")
+		}
+		// No hash of the secret without --sensitive: it would let anyone
+		// with the log test guesses without paying for scrypt.
+		utils.Debugf("[KEY] loaded from %s: len=%d", *encryptionKeyFile, len(secret))
+		if utils.Sensitive() {
+			utils.Debugf("[KEY] secret sha256=%s", utils.Sha256Hex([]byte(secret)))
+		}
+	}
+
+	sessionContext, contextAlternates := transport.KDFContexts(*sessionContextFlag, globalDocUrl, contextSources(specs))
+	if *encryptionKeyFile != "" {
+		utils.Debugf("[KEY] context=%q sha256=%s (MUST match on both peers; %d alternates tried on mismatch)",
+			sessionContext, utils.Sha256Hex([]byte(sessionContext)), len(contextAlternates))
+		log.Printf("Encryption context: sha256 %s", utils.Sha256Short([]byte(sessionContext)))
+	}
+
+	// Decide whether we run the full Session path (encryption + negotiate)
+	// or the legacy single-transport path.
+	var (
+		managerInst *manager.Manager
+		trans       transport.Transport
+		exchanger   transport.CookieExchanger
+		demux       *transport.PortDemux
+	)
+
+	// configuredSession: the operator asked for a Session. [Transport]
+	// sections in a .conf describe one just like --transports.
+	//
+	// A classic setup (--transport=X) with a key runs as a Session too,
+	// with classic compatibility: a client falls back to the classic
+	// layering while the exit does not answer the handshake and upgrades
+	// once it does; an exit serves classic clients and Session clients.
+	// Only --negotiate is strict. Without a key only classic is possible.
+	configuredSession := *negotiate || *transportsFlag != "" || len(confTransports) > 0
+	classicCompat := false
+	switch {
+	case *role != roleClient && *role != roleExit:
+	case !configuredSession && secret != "":
+		classicCompat = true
+	case configuredSession && !*negotiate && *role == roleClient && len(specs) == 1:
+		classicCompat = true
+	}
+	if configuredSession || classicCompat {
+		if secret == "" {
+			log.Fatal("--transports/--negotiate/.conf transports require --encryption-key-file")
+		}
+		switch {
+		case classicCompat && isExit:
+			log.Printf("Mode: Session, also serving classic clients (--negotiate makes it Session-only)")
+		case classicCompat:
+			log.Printf("Mode: Session, falling back to classic while the exit does not answer the handshake")
+		default:
+			log.Printf("Mode: Session")
+		}
+
+		caps := transport.CapabilityIPv4 | transport.CapabilityTCP | transport.CapabilityUDP
+		if *role == roleClient || exitMode == tunnel.ExitModeL3 {
+			caps |= transport.CapabilityICMPErrors
+		}
+		params := transport.PeerParameters{
+			Capabilities:  caps,
+			MaxPacketSize: *maxPacket,
+		}
+		sess, err := transport.NewSession(params, isExit)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if classicCompat {
+			sess.SetClassic(*codec)
+		}
+		sess.SetAlternateContexts(contextAlternates)
+
+		// Build the factory that SubtypeTransportStart will use for
+		// dynamic transports.
+		factory := transportFactory(config, isExit)
+		managerInst = manager.New(sess, factory, secret, sessionContext)
+
+		if err := registerBootstrapTransports(managerInst, specs, config, secret, sessionContext, rooms); err != nil {
+			log.Fatalf("bootstrap transports: %v", err)
+		}
+
+		// Headless auto-update for .flux carriers (the app's ScriptUpdater has
+		// no equivalent on a CLI/exit node): keep them current and self-heal by
+		// hot-swapping a reloaded package into the live Session.
+		if *scriptAutoUpdate {
+			startNodeScriptUpdater(context.Background(), managerInst, specs, config, *scriptUpdateChannel)
+		}
+
+		// Persist each cookie-carrying transport's jar and replay what was
+		// saved; the Manager routes cookie control messages by name.
+		if store != nil {
+			for _, spec := range specs {
+				if !transportHasCookies(spec.Type) {
+					continue
+				}
+				if err := managerInst.UseCookieStore(store, spec.Name, sessionCookieKey(spec, maxUid)); err != nil {
+					utils.Debugf("[COOKIE] replay %s: %v", spec.Name, err)
+				}
+			}
+		}
+
+		// Hook the Session control dispatcher into the manager.
+		sess.SetControlHandler(managerInst.DispatchControl)
+
+		// Optional IPC bridge: if --ipc-socket is set, the core talks to the
+		// mobile app over a Unix domain socket. Transport-initiated captcha
+		// requests go out as MsgCookiesRequest; cookies offers come in as
+		// MsgCookiesOffer.
+		if *ipcSocketPath != "" {
+			h := &coreIPCHandler{manager: managerInst}
+			srv := ipc.NewServer(*ipcSocketPath, h)
+			if err := srv.Listen(); err != nil {
+				log.Fatalf("IPC listen %s: %v", *ipcSocketPath, err)
+			}
+			defer srv.Close()
+			statusServer = srv
+
+			// Checks for local transports go to the app as-is; checks the
+			// exit reports are marked Remote, to be passed from its address.
+			managerInst.SetCaptchaNotifier(func(name, url, html, reason string) {
+				_ = srv.SendCookiesRequest(localCheckRequest(name, url, html, reason))
+			})
+			if *role == roleClient {
+				demux = transport.NewPortDemux(managerInst, authProxyPortLo, authProxyPortHi)
+				authProxy := &remoteAuthProxy{demux: demux}
+				managerInst.SetRemoteAuthNotifier(func(name, url, html, reason string) {
+					if remoteCheckRequest(name, url, html, reason, "") == nil {
+						log.Printf("remote check from %s ignored: its address is not a site this machine may open and it brought no page", name)
+						return
+					}
+					proxy, err := authProxy.Addr()
+					if err != nil {
+						log.Printf("remote auth proxy: %v", err)
+					}
+					_ = srv.SendCookiesRequest(remoteCheckRequest(name, url, html, reason, proxy))
+				})
+			}
+		}
+
+		trans = managerInst
+		if demux != nil {
+			trans = demux
+		}
+		exchanger = nil // cookie handling lives in the Manager
+
+	} else {
+		// Classic single-transport path without a Session: no key (the
+		// Session needs one), or a bench role.
+		// The types the classic path serves; the registry builds them.
+		switch *transportType {
+		case "boards", "vyandex", "yandex", "oneme", "cupsonline", "avito", "mailru", "telemost":
+		default:
+			log.Fatalf("Unknown transport type: %s", *transportType)
+		}
+		inner, err := registry.New(*transportType, globalDocUrl,
+			map[string]interface{}{"token": maxToken, "uid": maxUid, "exit": isExit},
+			registry.Options{Base: config, IsExit: isExit, YandexCookiesFile: yandexCookiesFile, AvitoCookies: avitoCookiesStr})
+		if err != nil {
+			log.Fatalf("%s: %v", *transportType, err)
+		}
+		if r, ok := inner.(roomLister); ok {
+			rooms[specs[0].Name] = r
+		}
+
+		// The carrier itself, before the codec and encryption wrap it: the one that raises checks.
+		carrier := inner
+
+		// Persist cookie exchanger for the legacy path.
+		if store != nil {
+			if ce, ok := inner.(transport.CookieExchanger); ok {
+				// The key the Session path uses too, so a jar carries over
+				// when a key is added or removed.
+				key := sessionCookieKey(specs[0], maxUid)
+				if jar := store.Load(key); jar != nil {
+					_ = ce.ApplyCookies(jar)
+				}
+				exchanger = transport.NewPersistentCookieExchanger(ce, store, key)
+			}
+		}
+
+		// Either framing is accepted; the preferred one is sent until the
+		// peer shows which it speaks (see transport.CodecTransport).
+		log.Printf("Codec: %s preferred, falls back to the other framing when the peer does not answer", *codec)
+		inner = transport.NewCodecTransport(inner, *codec, !isExit)
+
+		if *encryptionKeyFile != "" {
+			encrypted, err := transport.NewEncryptedTransport(inner, secret, sessionContext, isExit)
+			if err != nil {
+				log.Fatalf("Configure encrypted transport: %v", err)
+			}
+			encrypted.SetAlternateContexts(contextAlternates)
+			inner = encrypted
+			log.Printf("Transport encryption: AES-256-GCM enabled")
+		} else {
+			log.Printf("Transport encryption: OFF (no --encryption-key-file): the carrier sees the traffic, and a peer with a key cannot talk to this one")
+		}
+
+		trans = inner
+
+		// The app's IPC bridge works here too: traffic totals for its speed
+		// counters, and cookies it offers go to the carrier.
+		if *ipcSocketPath != "" {
+			srv := ipc.NewServer(*ipcSocketPath, &coreIPCHandler{exchanger: exchanger})
+			if err := srv.Listen(); err != nil {
+				log.Fatalf("IPC listen %s: %v", *ipcSocketPath, err)
+			}
+			defer srv.Close()
+			statusServer = srv
+			wireCheckNotifier(carrier, srv)
+		}
+	}
+
+	_ = exchanger
+	_ = managerInst
 
 	// Benchmark modes run the transport directly with no tunnel / raw socket,
 	// so they never touch the host network.
@@ -464,159 +1087,165 @@ DEPRECATED (removed in v2)
 		if *benchBytes <= 0 {
 			log.Fatalf("--role=bench-send requires --bench-bytes=<MB>")
 		}
-		startTrafficStats(trans)
 		runBenchSend(trans, *benchBytes, *benchCompressible)
 		return
 	}
 	if *role == roleBenchSink {
-		startTrafficStats(trans)
 		runBenchSink(trans)
 		return
 	}
 
-	if ms, ok := trans.(*transport.MultiStreamTransport); ok && *statusEvery > 0 {
-		go multistreamStatusLoop(ms, urls, *statusEvery)
+	if err := trans.Start(); err != nil {
+		log.Fatalf("Failed to start transport: %v", err)
+	}
+
+	if statusServer != nil {
+		if managerInst != nil {
+			utils.SafeGo("ipc-status", func() {
+				ipcStatusLoop(statusServer, managerInst, managerInst.Session().ActiveTransport, managerInst.Session().ActiveTransports)
+			})
+		} else {
+			utils.SafeGo("ipc-status", func() { ipcStatusLoop(statusServer, trans, nil, nil) })
+		}
+	}
+
+	// Periodically ask the exit node to refresh its cookies. Only the client
+	// initiates; the exit answers with SubtypeCookiesResponse.
+	if *role == roleClient && managerInst != nil {
+		utils.SafeGo("cookie-refresh", func() { managerRefreshLoop(managerInst) })
+	}
+	if managerInst != nil {
+		if pp, ready := managerInst.Session().PeerParameters(); ready {
+			log.Printf("Authenticated peer: IPv4 TCP; UDP=%t; ICMP errors=%t; maximum packet=%d",
+				pp.Capabilities&transport.CapabilityUDP != 0,
+				pp.Capabilities&transport.CapabilityICMPErrors != 0,
+				pp.MaxPacketSize)
+		}
+	} else if n, ok := trans.(*transport.Session); ok {
+		if pp, ready := n.PeerParameters(); ready {
+			log.Printf("Authenticated peer: IPv4 TCP; UDP=%t; ICMP errors=%t; maximum packet=%d",
+				pp.Capabilities&transport.CapabilityUDP != 0,
+				pp.Capabilities&transport.CapabilityICMPErrors != 0,
+				pp.MaxPacketSize)
+		}
+	}
+
+	// A Telemost participant that vanishes without closing its socket lingers
+	// on the SFU as a ghost for ~50 s; stop cleanly on a signal so the lanes
+	// leave the room and a quick restart finds it empty.
+	if hasTelemost(specs) {
+		sigCh := make(chan os.Signal, 1)
+		notifySignals(sigCh)
+		go func() {
+			<-sigCh
+			log.Printf("Signal received, leaving Telemost room cleanly...")
+			_ = trans.Stop()
+			os.Exit(0)
+		}()
 	}
 
 	switch *role {
 	case roleExit:
-		runExit(trans, exitMode, *upstreamProxy)
+		var printLink func()
+		if *shareFlag {
+			// A classic exit keeps advertising classic: older clients
+			// read the link too, and updated ones upgrade on their own.
+			session := configuredSession
+			host := *shareHost
+			if host == "" {
+				host = publicIPv4()
+			}
+			printLink = func() {
+				printShare(shareConfig(specs, session, *codec, secret, sessionContext, host, rooms))
+			}
+		}
+		// A cupsonline exit learns its room list only once it runs. Older
+		// classic clients derived their key from that list; accept it as
+		// an alternate context. Rooms created later (a start that failed
+		// and was retried) or anew change the link: print it again.
+		var sess *transport.Session
+		if managerInst != nil {
+			sess = managerInst.Session()
+		}
+		for _, r := range rooms {
+			r.OnRoomList(func(packed string) {
+				if sess != nil && packed != "" {
+					sess.SetAlternateContexts([]string{packed})
+				}
+				if printLink != nil {
+					printLink()
+				}
+			})
+			if list := r.RoomList(); list != "" && sess != nil {
+				sess.SetAlternateContexts([]string{list})
+			}
+		}
+		if printLink != nil {
+			printLink()
+		}
+		runExit(trans, exitMode)
 	case roleClient:
-		runClient(trans, *inbound, *socksAddr, exitMode)
+		runClient(trans, *inbound, *socksAddr, *httpProxyAddr, exitMode)
 	default:
 		log.Fatalf("unhandled role %q", *role)
 	}
 }
 
-// runUpdate returns true only when the replacement was started. An automatic
-// check is best-effort; it must not prevent the client from connecting.
-func runUpdate(install, automatic bool) bool {
-	if runtime.GOOS == "android" {
-		if !automatic {
-			fmt.Println("Android app updates are installed through the APK")
-		}
-		return false
-	}
-	if version == "dev" {
-		if !automatic {
-			fmt.Println("Development build: no release version to compare")
-		}
-		return false
-	}
-	timeout := 8 * time.Second
-	if automatic {
-		timeout = 3 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	available, err := updater.Check(ctx, version)
-	if err != nil {
-		if !automatic {
-			log.Fatalf("Update check failed: %v", err)
-		}
-		return false
-	}
-	if available == nil {
-		if !automatic {
-			fmt.Println("Already up to date")
-		}
-		return false
-	}
-	if !install {
-		fmt.Printf("New release available: %s\n", available.Version)
-		return false
-	}
-	if automatic && !updater.AutoCompatible(version, available.Version) {
-		log.Printf("New release %s needs an explicit --self-update", available.Version)
-		return false
-	}
-	staged, err := updater.Download(context.Background(), available)
-	if err != nil {
-		if !automatic {
-			log.Fatalf("Update download failed: %v", err)
-		}
-		log.Printf("Update download failed: %v", err)
-		return false
-	}
-	if err := updater.Install(staged, version, os.Args[1:]); err != nil {
-		_ = os.Remove(staged)
-		if !automatic {
-			log.Fatalf("Update installation failed: %v", err)
-		}
-		log.Printf("Update installation failed: %v", err)
-		return false
-	}
-	log.Printf("Installed OpenFlux %s; starting the new version", available.Version)
-	return true
+// statusServer is the IPC bridge, set when --ipc-socket is given.
+var statusServer *ipc.Server
+
+// statusSource is what the IPC status reports on: a Session's manager or
+// a classic carrier without one.
+type statusSource interface {
+	IsConnected() bool
+	Stats() transport.TransportStats
 }
 
-// newStream builds the transport stack for one document: the raw transport,
-// optional encryption directly on it, and the app-layer codec outermost.
-func newStream(transportType, docURL, role, codec string, enc *encryptionSetup, config transport.TransportConfig, cookieFile, challengeFile string) transport.Transport {
-	var inner transport.Transport
-	switch transportType {
-	case "vyandex":
-		t := yandex.NewYandexVolgaTransport(docURL, config)
-		t.ConfigureManualChallenge(cookieFile, challengeFile)
-		inner = t
-	case "yandex":
-		t := yandex.NewYandexDocsTransport(docURL, config)
-		t.ConfigureManualChallenge(cookieFile, challengeFile)
-		inner = t
-	case "oneme":
-		uidint, _ := strconv.ParseInt(maxUid, 10, 64)
-		inner = oneme.NewOneMeTransport(role == roleExit, maxToken, uidint, config)
-	case "cupsonline":
-		inner = cupsonline.NewCupsonlineTransport(docURL, config, role != roleExit)
-	case "mailru":
-		inner = mailru.NewMailruDocsTransport(docURL, config)
-	default:
-		log.Fatalf("Unknown transport type: %s", transportType)
-	}
-
-	// Optional encryption sits on the raw transport, under the codec, so one
-	// AEAD covers a whole compressed batch.
-	if enc != nil {
-		encrypted, err := enc.wrap(inner)
-		if err != nil {
-			log.Fatalf("Configure encrypted transport: %v", err)
+// ipcStatusLoop reports to the app every second: whether a carrier reaches
+// the peer, traffic totals, uptime and (Sessions) the active carrier.
+func ipcStatusLoop(srv *ipc.Server, src statusSource, active func() string, activeAll func() []string) {
+	started := time.Now()
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for range tick.C {
+		st := src.Stats()
+		p := &ipc.StatusPayload{
+			Running:   true,
+			Connected: src.IsConnected(),
+			BytesIn:   st.BytesReceived,
+			BytesOut:  st.BytesSent,
+			UptimeMs:  time.Since(started).Milliseconds(),
 		}
-		inner = encrypted
+		if active != nil {
+			p.Active = active()
+		}
+		if activeAll != nil {
+			p.ActiveAll = activeAll()
+		}
+		_ = srv.SendStatus(p)
 	}
-
-	// App-layer codec. Default is the batching+zstd layer; --codec=legacy
-	// selects the old per-packet LZ4 path so the two can be compared over the
-	// same channel. Client and exit node must use the same one.
-	switch codec {
-	case codecBatched:
-		inner = transport.NewBatchedTransport(inner)
-	case codecLegacy:
-		inner = transport.NewCompressedTransport(inner)
-	}
-	return inner
 }
 
-func runExit(trans transport.Transport, exitMode tunnel.ExitMode, upstreamProxy string) {
-	ex, err := tunnel.NewExitNode(trans, exitMode.String(), upstreamProxy)
+func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {
+	if exitMode == tunnel.ExitModeL3 {
+		if err := tunnel.SetLocalIP(localIP); err != nil {
+			log.Fatalf("--local-ip: %v", err)
+		}
+	}
+	ex, err := tunnel.NewExitNode(trans, exitMode.String())
 	if err != nil {
 		log.Fatalf("exit node: %v", err)
 	}
-	if upstreamProxy != "" {
-		log.Printf("Running as EXIT NODE with upstream proxy (%s) - mode=%s", upstreamProxy, ex.Mode())
-	} else {
-		log.Printf("Running as EXIT NODE (mode=%s)", ex.Mode())
-	}
-	// The exit node registers its receive callback in Start, so the transport
-	// starts afterwards and no early frame is dropped.
+	log.Printf("Running as EXIT NODE (mode=%s)", ex.Mode())
 	if err := ex.Start(); err != nil {
 		log.Fatalf("exit start: %v", err)
 	}
-	startTransport(trans)
 
 	// L3 SNAT rewrites source IPs; the kernel sees return packets for
 	// connections it never opened and emits RST, tearing them down.
-	// The operator must drop outbound RSTs matching the egress IP.
-	if exitMode == tunnel.ExitModeL3 {
+	// On Linux the operator must drop outbound RSTs matching the egress IP;
+	// the Windows backend drops them itself, per flow, through WinDivert.
+	if exitMode == tunnel.ExitModeL3 && runtime.GOOS == "linux" {
 		if localIP != "" {
 			log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s %s -j DROP", localIP)
 		} else {
@@ -628,54 +1257,110 @@ func runExit(trans transport.Transport, exitMode tunnel.ExitMode, upstreamProxy 
 		}
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	notifySignals(sigCh)
-	<-sigCh
-	log.Printf("Shutting down exit node...")
-	if err := ex.Stop(); err != nil {
-		log.Printf("exit stop: %v", err)
-	}
-	log.Printf("Shutdown complete")
+	select {}
 }
 
-func startTransport(trans transport.Transport) {
-	if err := trans.Start(); err != nil {
-		log.Fatalf("Failed to start transport: %v", err)
+// runStreamClient runs the --mode=stream client: a raw transport carries the
+// phpbox stream mux, and a local SOCKS5 (and optional HTTP) proxy dials each
+// app connection out as a mux stream to the phpbox exit. No gVisor, no IP
+// packets. The proxying itself is package streamproxy, shared with the
+// mobile bridges.
+// streamCarrier builds the carrier the stream mux rides.
+func streamCarrier(transportType, url string) phpbox.Carrier {
+	switch transportType {
+	case "cupsonline", "yandex", "", "vyandex", "mailru":
+	default:
+		log.Fatalf("--mode=stream: transport %q not supported (use cupsonline, yandex, vyandex, mailru)", transportType)
 	}
-	startTrafficStats(trans)
+	t, err := registry.New(transportType, url, nil, registry.Options{
+		Base: transport.DefaultConfig(), YandexCookiesFile: yandexCookiesFile, AvitoCookies: avitoCookiesStr,
+	})
+	if err != nil {
+		log.Fatalf("--mode=stream %s: %v", transportType, err)
+	}
+	carrier, ok := t.(phpbox.Carrier)
+	if !ok {
+		log.Fatalf("--mode=stream: transport %q cannot carry a stream", transportType)
+	}
+	return carrier
 }
 
-// startTrafficStats emits --traffic-stats lines for any role.
-func startTrafficStats(trans transport.Transport) {
-	if trafficEvery <= 0 {
-		return
+// runStreamTUN is the stream mode as a full tunnel (--inbound=tun): the
+// system's traffic goes into a local stack that opens one mux stream per TCP
+// connection (tunnel.StreamNet, which is a transport, so the utun/Wintun
+// client runs on it as it does on any other).
+func runStreamTUN(transportType, url string) {
+	sn := tunnel.NewStreamNet(streamCarrier(transportType, url))
+	if err := sn.Start(); err != nil {
+		log.Fatalf("--mode=stream: %v", err)
 	}
-	go func() {
-		ticker := time.NewTicker(trafficEvery)
-		defer ticker.Stop()
-		for range ticker.C {
-			s := trans.Stats()
-			log.Printf("[TRAFFIC] connected=%t tx=%d rx=%d", s.Connected, s.BytesSent, s.BytesReceived)
+	log.Printf("Running as CLIENT (stream mux over %s, full tunnel)", transportType)
+	runClientTUN(sn)
+}
+
+func runStreamClient(transportType, url, socksAddr, httpProxyAddr, ipcSocket string) {
+	carrier := streamCarrier(transportType, url)
+	p, err := streamproxy.Start(streamproxy.Options{Carrier: carrier, Socks: socksAddr, HTTP: httpProxyAddr, Label: transportType})
+	if err != nil {
+		log.Fatalf("--mode=stream: %v", err)
+	}
+	defer p.Stop()
+
+	// The app's IPC bridge works here too: traffic totals for its speed counters.
+	if ipcSocket != "" {
+		var exchanger transport.CookieExchanger
+		if x, ok := carrier.(transport.CookieExchanger); ok {
+			exchanger = x
 		}
-	}()
+		srv := ipc.NewServer(ipcSocket, &coreIPCHandler{exchanger: exchanger})
+		if err := srv.Listen(); err != nil {
+			log.Fatalf("IPC listen %s: %v", ipcSocket, err)
+		}
+		defer srv.Close()
+		statusServer = srv
+		go streamStatusLoop(srv, p)
+	}
+
+	if httpProxyAddr != "" {
+		log.Printf("HTTP proxy on %s", httpProxyAddr)
+	}
+	log.Printf("Running as CLIENT (stream mux over %s, SOCKS5 on %s)", transportType, socksAddr)
+	select {}
 }
 
-func runClient(trans transport.Transport, inbound, socksAddr string, exitMode tunnel.ExitMode) {
+// streamStatusLoop reports the stream client to the app every second.
+func streamStatusLoop(srv *ipc.Server, p *streamproxy.Proxy) {
+	started := time.Now()
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for range tick.C {
+		_ = srv.SendStatus(&ipc.StatusPayload{
+			Running:   true,
+			Connected: p.Connected(),
+			BytesIn:   uint64(p.BytesReceived()),
+			BytesOut:  uint64(p.BytesSent()),
+			UptimeMs:  time.Since(started).Milliseconds(),
+		})
+	}
+}
+
+func runClient(trans transport.Transport, inbound, socksAddr, httpProxyAddr string, exitMode tunnel.ExitMode) {
 	switch inbound {
 	case inboundTUN:
-		// The utun client waits for the transport's sockets before taking the
-		// default route, so the transport has to be up first.
-		startTransport(trans)
 		runClientTUN(trans)
 	case inboundSOCKS5:
 		// Explicit opt-in to the legacy SOCKS5+gVisor client. Kept as a fallback
 		// for platforms without a tun client (see README).
 		log.Printf("Running as CLIENT (SOCKS5 on %s, legacy gVisor path)", socksAddr)
-		tun, err := tunnel.NewTCPTunnelMode(trans, false, exitMode)
-		if err != nil {
-			log.Fatalf("tunnel init: %v", err)
+		tun := tunnel.NewTCPTunnelMode(trans, false, exitMode)
+		if httpProxyAddr != "" {
+			ln, err := net.Listen("tcp", httpProxyAddr)
+			if err != nil {
+				log.Fatalf("--http-proxy %s: %v", httpProxyAddr, err)
+			}
+			log.Printf("HTTP proxy on %s", httpProxyAddr)
+			utils.SafeGo("http-proxy", func() { _ = tunnel.ServeHTTPProxy(ln, tun.DialTCP) })
 		}
-		startTransport(trans)
 		socks5Server := socks5.NewSOCKS5Server(socksAddr, tun)
 		log.Fatal(socks5Server.Start())
 	default:
@@ -722,4 +1407,14 @@ func runClientTUN(trans transport.Transport) {
 	tc.RestoreDefault()
 	log.Printf("Shutdown complete")
 	os.Exit(0)
+}
+
+// hasTelemost reports whether any configured transport is a Telemost one.
+func hasTelemost(specs []transportSpec) bool {
+	for _, sp := range specs {
+		if sp.Type == "telemost" {
+			return true
+		}
+	}
+	return false
 }

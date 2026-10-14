@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -8,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // Defaults for the coalescing layer. Tunable at runtime via env vars so the
@@ -18,7 +19,7 @@ const (
 	defaultMaxBatchBytes = 8192
 	defaultMaxBatchCount = 64
 	defaultLingerMs      = 5
-	batchQueueDepth      = 4096
+	batchQueueDepth      = 256 // At most 16 MiB of queued packet data.
 )
 
 // BatchedTransport replaces the old per-packet CompressedTransport. It queues
@@ -27,6 +28,10 @@ const (
 //
 // This is the symmetric layer: client and exit node must both use it (they do,
 // because main.go wraps both the same way).
+//
+// BatchedTransport speaks wire-format v2 only. Capability negotiation lives
+// in NegotiatedTransport (transport/negotiated.go); the retired wire-v3
+// prototype is no longer supported and fails startup if forced.
 type BatchedTransport struct {
 	Transport
 
@@ -35,34 +40,14 @@ type BatchedTransport struct {
 	maxBatchBytes int
 	maxBatchCount int
 
-	running atomic.Bool
-	stop    chan struct{}
-	stopMu  sync.Mutex
-	flushWG sync.WaitGroup
+	running    atomic.Bool
+	lifecycle  sync.Mutex
+	stopOnce   sync.Once
+	stopCh     chan struct{}
+	sendErrors atomic.Uint64
 
 	mu     sync.RWMutex
 	userCb func([]byte)
-
-	// sendErrors counts batches dropped because the wrapped transport's
-	// Send failed (e.g. mid-reconnect). flushLoop used to ignore this
-	// return value entirely, so a transport hiccup silently dropped
-	// whole batches with no signal anywhere.
-	sendErrors atomic.Uint64
-
-	decodeWarn *rateLog
-}
-
-// SendErrors returns the number of flushed batches lost to a Send error on
-// the wrapped transport since the transport started.
-func (b *BatchedTransport) SendErrors() uint64 { return b.sendErrors.Load() }
-
-// sendBatch flushes one coalesced batch and records/logs a failure instead
-// of discarding it silently.
-func (b *BatchedTransport) sendBatch(batch [][]byte) {
-	if err := b.Transport.Send(encodeBatch(batch)); err != nil {
-		b.sendErrors.Add(1)
-		utils.Debugf("[BATCH] flush send error, dropped %d packets: %v", len(batch), err)
-	}
 }
 
 func envInt(name string, def int) int {
@@ -74,135 +59,171 @@ func envInt(name string, def int) int {
 	return def
 }
 
-func NewBatchedTransport(inner Transport) *BatchedTransport {
-	return NewBatchedTransportWithQueueDepth(inner, batchQueueDepth)
-}
-
-// NewBatchedTransportWithQueueDepth bounds the number of waiting packets for
-// memory-constrained clients. The default constructor preserves CLI behavior.
-func NewBatchedTransportWithQueueDepth(inner Transport, queueDepth int) *BatchedTransport {
-	if queueDepth < 1 {
-		queueDepth = 1
+// NewBatchedTransport wraps inner with the coalescing layer. An optional
+// batchBytesHint (the first variadic value, when > 0) raises the default batch
+// size for a carrier whose per-connection limit is on message COUNT, not bytes
+// — see BatchSizeHinter. OPENFLUX_BATCH_BYTES still overrides it.
+func NewBatchedTransport(inner Transport, batchBytesHint ...int) *BatchedTransport {
+	defBatchBytes := defaultMaxBatchBytes
+	if len(batchBytesHint) > 0 && batchBytesHint[0] > 0 {
+		defBatchBytes = batchBytesHint[0]
 	}
-	return &BatchedTransport{
+	b := &BatchedTransport{
 		Transport:     inner,
-		queue:         make(chan []byte, queueDepth),
-		stop:          make(chan struct{}),
+		queue:         make(chan []byte, batchQueueDepth),
 		lingerMs:      envInt("OPENFLUX_BATCH_LINGER_MS", defaultLingerMs),
-		maxBatchBytes: envInt("OPENFLUX_BATCH_BYTES", defaultMaxBatchBytes),
-		maxBatchCount: envInt("OPENFLUX_BATCH_COUNT", defaultMaxBatchCount),
-		decodeWarn:    newRateLog(10 * time.Second),
+		maxBatchBytes: min(envInt("OPENFLUX_BATCH_BYTES", defBatchBytes), maxFrameBytes-65537),
+		maxBatchCount: min(envInt("OPENFLUX_BATCH_COUNT", defaultMaxBatchCount), maxFrameRecords-1),
+		stopCh:        make(chan struct{}),
 	}
+	utils.Debugf("[BATCH] created: lingerMs=%d maxBatchBytes=%d maxBatchCount=%d queueCap=%d",
+		b.lingerMs, b.maxBatchBytes, b.maxBatchCount, batchQueueDepth)
+	return b
 }
 
 func (b *BatchedTransport) Start() error {
+	utils.Debugf("[BATCH] Start() called")
+	b.lifecycle.Lock()
+	defer b.lifecycle.Unlock()
+	if os.Getenv("OPENFLUX_EXPERIMENTAL_WIRE_V3") == "1" {
+		return fmt.Errorf("unauthenticated wire-v3 negotiation has been retired; unset OPENFLUX_EXPERIMENTAL_WIRE_V3 and use --negotiate with encryption on both peers")
+	}
+	select {
+	case <-b.stopCh:
+		return fmt.Errorf("batched transport is stopped")
+	default:
+	}
+	if b.running.Load() {
+		utils.Debugf("[BATCH] Start: already running")
+		return nil
+	}
+	utils.Debugf("[BATCH] Start: starting inner transport")
 	if err := b.Transport.Start(); err != nil {
+		utils.Debugf("[BATCH] Start: inner Start failed: %v", err)
 		return err
 	}
 	b.running.Store(true)
-	b.flushWG.Add(1)
-	go func() {
-		defer b.flushWG.Done()
-		b.flushLoop()
-	}()
+	go b.flushLoop()
+	utils.Debugf("[BATCH] Start: OK")
 	return nil
 }
 
-// Stop ends the flush loop and waits for it before stopping the inner
-// transport, so no goroutine outlives the transport. Packets still queued are
-// dropped; the tunnel is going away.
 func (b *BatchedTransport) Stop() error {
-	b.running.Store(false)
-	b.stopMu.Lock()
+	utils.Debugf("[BATCH] Stop() called")
+	b.lifecycle.Lock()
+	defer b.lifecycle.Unlock()
 	select {
-	case <-b.stop:
+	case <-b.stopCh:
+		return nil
 	default:
-		close(b.stop)
 	}
-	b.stopMu.Unlock()
-	b.flushWG.Wait()
+	b.running.Store(false)
+	b.stopOnce.Do(func() { close(b.stopCh) })
 	return b.Transport.Stop()
 }
 
-// Send copies the packet (the caller's buffer is reused by gVisor) and enqueues
-// it for batching. A full queue drops the packet; the tunnel's TCP will
-// retransmit, same as the old "write queue full" behavior.
+// Send copies the packet (the caller's buffer may be reused) and enqueues it
+// for batching. A full queue returns an explicit error; TCP may retransmit,
+// while UDP callers must treat it as datagram loss.
 func (b *BatchedTransport) Send(data []byte) error {
+	b.lifecycle.Lock()
+	defer b.lifecycle.Unlock()
 	if !b.running.Load() {
-		return fmt.Errorf("batched transport stopped")
+		utils.Debugf("[BATCH] Send: not running, dropping %d bytes", len(data))
+		return fmt.Errorf("batched transport is not running")
 	}
-	if len(data) == 0 || len(data) > maxFrameBytes-4 {
-		return fmt.Errorf("packet size %d out of range", len(data))
+	if len(data) > 65535 {
+		utils.Debugf("[BATCH] Send: packet too large %d", len(data))
+		return fmt.Errorf("packet too large for batch record: %d bytes", len(data))
 	}
 	p := make([]byte, len(data))
 	copy(p, data)
 	select {
 	case b.queue <- p:
+		utils.Debugf("[BATCH] Send: enqueued %d bytes (queue %d/%d)",
+			len(p), len(b.queue), cap(b.queue))
 		return nil
 	default:
+		utils.Debugf("[BATCH] Send: QUEUE FULL, dropped %d bytes", len(p))
 		return fmt.Errorf("batch queue full")
 	}
 }
 
 func (b *BatchedTransport) Receive(callback func([]byte)) {
+	utils.Debugf("[BATCH] Receive: callback installed")
 	b.mu.Lock()
 	b.userCb = callback
 	b.mu.Unlock()
 
+	// Frames here are plaintext and can carry control messages with cookie
+	// jars, so their hexdumps need --sensitive as well as -ddd.
 	b.Transport.Receive(func(data []byte) {
+		utils.Debugf("[BATCH] Recv: %d wire bytes", len(data))
+		if utils.IsVerbose() && utils.Sensitive() {
+			utils.Debugf("[BATCH] Recv wire hexdump:\n%s", hex.Dump(data))
+		}
 		pkts, err := decodeBatch(data)
 		if err != nil {
-			b.decodeWarn.Printf("[BATCH] dropped undecodable frame (%d bytes): %v - "+
-				"does the peer use the same --codec and encryption settings?", len(data), err)
+			utils.Debugf("[BATCH] decode error (%d bytes): %v", len(data), err)
+			if utils.IsVerbose() && utils.Sensitive() {
+				utils.Debugf("[BATCH] bad frame hexdump:\n%s", hex.Dump(data))
+			}
 			return
 		}
+		utils.Debugf("[BATCH] Recv: decoded %d packets", len(pkts))
 		b.mu.RLock()
 		cb := b.userCb
 		b.mu.RUnlock()
 		if cb == nil {
+			utils.Debugf("[BATCH] Recv: no callback, dropping %d packets", len(pkts))
 			return
 		}
-		for _, p := range pkts {
+		for i, p := range pkts {
+			utils.Debugf("[BATCH] Recv: delivering packet %d/%d size=%d", i+1, len(pkts), len(p))
+			if utils.IsVerbose() && utils.Sensitive() {
+				utils.Debugf("[BATCH] packet %d hexdump:\n%s", i+1, hex.Dump(p))
+			}
 			cb(p)
 		}
 	})
 }
 
+// SendErrors counts Transport.Send failures observed by the batching layer.
+func (b *BatchedTransport) SendErrors() uint64 { return b.sendErrors.Load() }
+
+func (b *BatchedTransport) recordSendError(err error) {
+	b.sendErrors.Add(1)
+	utils.Debugf("[BATCH] send error (total=%d): %v", b.sendErrors.Load(), err)
+}
+
 func (b *BatchedTransport) flushLoop() {
+	utils.Debugf("[BATCH] flushLoop: started")
 	for b.running.Load() {
 		var first []byte
 		select {
-		case first = <-b.queue:
-		case <-b.stop:
+		case <-b.stopCh:
+			utils.Debugf("[BATCH] flushLoop: stop signal, exiting")
 			return
+		case first = <-b.queue:
+			utils.Debugf("[BATCH] flushLoop: dequeued first packet size=%d (queue %d/%d)",
+				len(first), len(b.queue), cap(b.queue))
 		}
 		batch := [][]byte{first}
 		size := 2 + len(first)
-		// fits reports whether p can join the batch without exceeding the
-		// frame cap the transports enforce.
-		fits := func(p []byte) bool { return size+2+len(p)+2 <= maxFrameBytes }
 
 		// Phase 1: absorb everything already queued (burst coalescing). This
 		// alone collapses a window's worth of segments into one message.
 	drainNow:
 		for size < b.maxBatchBytes && len(batch) < b.maxBatchCount {
 			select {
-			case p, ok := <-b.queue:
-				if !ok {
-					b.sendBatch(batch)
-					return
-				}
-				if !fits(p) {
-					b.sendBatch(batch)
-					batch, size = [][]byte{p}, 2+len(p)
-					continue
-				}
+			case p := <-b.queue:
 				batch = append(batch, p)
 				size += 2 + len(p)
 			default:
 				break drainNow
 			}
 		}
+		utils.Debugf("[BATCH] flushLoop: phase1 drained to %d packets, %d bytes", len(batch), size)
 
 		// Phase 2: brief linger to catch stragglers arriving just after the
 		// burst. Negligible next to the channel RTT, but it fills batches
@@ -212,29 +233,33 @@ func (b *BatchedTransport) flushLoop() {
 		linger:
 			for size < b.maxBatchBytes && len(batch) < b.maxBatchCount {
 				select {
-				case p, ok := <-b.queue:
-					if !ok {
-						timer.Stop()
-						b.sendBatch(batch)
-						return
-					}
-					if !fits(p) {
-						b.sendBatch(batch)
-						batch, size = [][]byte{p}, 2+len(p)
-						continue
-					}
+				case <-b.stopCh:
+					timer.Stop()
+					utils.Debugf("[BATCH] flushLoop: stop during linger, exiting")
+					return
+				case p := <-b.queue:
 					batch = append(batch, p)
 					size += 2 + len(p)
 				case <-timer.C:
 					break linger
-				case <-b.stop:
-					timer.Stop()
-					return
 				}
 			}
 			timer.Stop()
+			utils.Debugf("[BATCH] flushLoop: phase2 linger done, %d packets, %d bytes",
+				len(batch), size)
 		}
 
-		b.sendBatch(batch)
+		encoded := encodeBatch(batch)
+		utils.Debugf("[BATCH] flushLoop: sending batch of %d packets (%d raw -> %d wire bytes)",
+			len(batch), size, len(encoded))
+		if utils.IsVerbose() && utils.Sensitive() {
+			utils.Debugf("[BATCH] flushLoop: batch hexdump:\n%s", hex.Dump(encoded))
+		}
+		if err := b.Transport.Send(encoded); err != nil {
+			b.recordSendError(err)
+		} else {
+			utils.Debugf("[BATCH] flushLoop: batch sent OK")
+		}
 	}
+	utils.Debugf("[BATCH] flushLoop: exit (running=false)")
 }

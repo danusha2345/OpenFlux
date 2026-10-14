@@ -5,30 +5,23 @@ struct ContentView: View {
     @StateObject private var vpn = VPNController()
 
     @AppStorage("transportKind") private var transportRaw: String = TransportKind.yandex.rawValue
-    @State private var secureSettings = ConnectionSettings()
-    @State private var settingsLoaded = false
-    @State private var settingsError: String?
+    @AppStorage("docURL") private var docURL: String = ""
+    @AppStorage("maxToken") private var maxToken: String = ""
+    @AppStorage("maxUid") private var maxUid: String = ""
     // Uncommon default port to avoid clashing with other local proxies.
     @AppStorage("socksPort") private var socksPort: String = "10808"
     @AppStorage("debugLog") private var debugLog: Bool = false
     @State private var showInfo = false
-    @State private var shareMessage: String?
-    @State private var pendingShare: ShareLink?
-    @State private var shareApproved = false
-    @State private var showShareConfirm = false
 
     private var transport: TransportKind {
         TransportKind(rawValue: transportRaw) ?? .yandex
     }
 
     private var canStart: Bool {
-        guard (Int(socksPort) ?? 0) > 0,
-              settingsLoaded, settingsError == nil,
-              !secureSettings.peerKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard (Int(socksPort) ?? 0) > 0 else { return false }
         switch transport {
-        case .yandex, .vyandex, .cupsonline, .mailru:
-            return !secureSettings.url.trimmingCharacters(in: .whitespaces).isEmpty
-        case .max:    return !secureSettings.maxToken.isEmpty && !secureSettings.maxUid.isEmpty
+        case .yandex: return !docURL.trimmingCharacters(in: .whitespaces).isEmpty
+        case .max:    return !maxToken.isEmpty && !maxUid.isEmpty
         }
     }
 
@@ -38,37 +31,17 @@ struct ContentView: View {
                 VStack(spacing: 16) {
                     statusHeader
 
-                    if let shareMessage {
-                        Text(shareMessage).font(.caption).foregroundColor(.secondary)
-                    }
-
                     Picker("Transport", selection: $transportRaw) {
                         ForEach(TransportKind.allCases) { t in
                             Text(t.title).tag(t.rawValue)
                         }
                     }
-                    .pickerStyle(.menu)
-                    .disabled(!settingsLoaded || tunnel.running || vpn.active)
+                    .pickerStyle(.segmented)
+                    .disabled(tunnel.running)
 
                     connectionFields
 
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Exit public key (Noise)").font(.caption).foregroundColor(.secondary)
-                        SecureField("base64 X25519 public key", text: secureBinding(\.peerKey))
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled(true)
-                            .textFieldStyle(.roundedBorder)
-                            .disabled(!settingsLoaded || tunnel.running || vpn.active)
-                    }
-
                     portField
-
-                    if let settingsError {
-                        Text(settingsError).font(.caption).foregroundColor(.red)
-                        Button("Retry loading settings") {
-                            Task { await loadSecureSettings() }
-                        }
-                    }
 
                     controls
 
@@ -79,22 +52,7 @@ struct ContentView: View {
                 .padding()
             }
             .navigationTitle("OpenFlux")
-            .task {
-                OpenFluxSetDebug(debugLog ? 1 : 0)
-                await loadSecureSettings()
-                await MainActor.run { applyPendingShare() }
-            }
-            .onOpenURL { url in
-                Task { @MainActor in
-                    guard let shared = ShareLink.decode(url) else {
-                        shareMessage = "Ссылка OpenFlux не подходит для этого клиента"
-                        return
-                    }
-                    pendingShare = shared
-                    shareApproved = false
-                    showShareConfirm = true
-                }
-            }
+            .onAppear { OpenFluxSetDebug(debugLog ? 1 : 0) }
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button { showInfo = true } label: {
@@ -103,15 +61,6 @@ struct ContentView: View {
                 }
             }
             .sheet(isPresented: $showInfo) { InfoView() }
-            .alert("Импортировать настройки OpenFlux?", isPresented: $showShareConfirm) {
-                Button("Отмена", role: .cancel) { pendingShare = nil }
-                Button("Импортировать") {
-                    shareApproved = true
-                    applyPendingShare()
-                }
-            } message: {
-                Text("URL транспорта и публичный ключ выходной ноды будут заменены. Подключение начнётся только после нажатия Start.")
-            }
         }
         .navigationViewStyle(.stack)
     }
@@ -119,13 +68,13 @@ struct ContentView: View {
     @ViewBuilder
     private var connectionFields: some View {
         switch transport {
-        case .yandex, .vyandex, .cupsonline, .mailru:
-            field(title: transport.title + " URL / room data",
-                  placeholder: transport == .mailru ? "https://cloud.mail.ru/public/..." : "Document or room URL",
-                  text: secureBinding(\.url))
+        case .yandex:
+            field(title: "Yandex Docs URL",
+                  placeholder: "https://docs.yandex.ru/docs/view?url=...",
+                  text: $docURL)
         case .max:
-            field(title: "MAX token", placeholder: "auth token", text: secureBinding(\.maxToken))
-            field(title: "MAX user ID", placeholder: "numeric id", text: secureBinding(\.maxUid),
+            field(title: "MAX token", placeholder: "auth token", text: $maxToken)
+            field(title: "MAX user ID", placeholder: "numeric id", text: $maxUid,
                   keyboard: .numberPad)
         }
     }
@@ -136,7 +85,7 @@ struct ContentView: View {
             TextField("10808", text: $socksPort)
                 .keyboardType(.numberPad)
                 .textFieldStyle(.roundedBorder)
-                .disabled(!settingsLoaded || tunnel.running || vpn.active)
+                .disabled(tunnel.running)
         }
     }
 
@@ -151,16 +100,15 @@ struct ContentView: View {
                 } else {
                     Button {
                         tunnel.start(transport: transport,
-                                     url: secureSettings.url,
-                                     maxToken: secureSettings.maxToken,
-                                     maxUid: secureSettings.maxUid,
-                                     peerKey: secureSettings.peerKey,
+                                     url: docURL,
+                                     maxToken: maxToken,
+                                     maxUid: maxUid,
                                      port: Int(socksPort) ?? 10808)
                     } label: {
                         Label("Start", systemImage: "play.fill").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!canStart || vpn.active || tunnel.busy)
+                    .disabled(!canStart)
                 }
                 Button { tunnel.testThroughProxy() } label: {
                     Label("Test", systemImage: "network").frame(maxWidth: .infinity)
@@ -190,12 +138,13 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
             } else {
                 Button {
-                    vpn.start(transport: transport.rawValue, settings: secureSettings)
+                    vpn.start(transport: transport.rawValue, url: docURL,
+                              maxToken: maxToken, maxUid: maxUid)
                 } label: {
                     Label("Start VPN", systemImage: "bolt.fill").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!canStart || tunnel.running)
+                .disabled(!canStart)
             }
             Text("Routes the whole device through the exit node (TCP + DNS-over-TCP).")
                 .font(.caption2).foregroundColor(.secondary)
@@ -211,57 +160,7 @@ struct ContentView: View {
                 .autocorrectionDisabled(true)
                 .keyboardType(keyboard)
                 .textFieldStyle(.roundedBorder)
-                .disabled(!settingsLoaded || tunnel.running || vpn.active)
-        }
-    }
-
-    private func secureBinding(_ keyPath: WritableKeyPath<ConnectionSettings, String>) -> Binding<String> {
-        Binding(get: { secureSettings[keyPath: keyPath] }, set: { value in
-            secureSettings[keyPath: keyPath] = value
-            do {
-                try SharedConnectionSettings.save(secureSettings)
-                settingsError = nil
-            } catch {
-                settingsError = "Cannot save connection settings: \(error.localizedDescription)"
-            }
-        })
-    }
-
-    private func loadSecureSettings() async {
-        guard !settingsLoaded else { return }
-        do {
-            let saved = try SharedConnectionSettings.loadOrReadLegacy()
-            secureSettings = try await vpn.migrateLegacyConfiguration(saved)
-            settingsLoaded = true
-            settingsError = nil
-        } catch {
-            settingsError = "Cannot load connection settings: \(error.localizedDescription)"
-        }
-    }
-
-    @MainActor
-    private func applyPendingShare() {
-        guard settingsLoaded, shareApproved, let shared = pendingShare,
-              let kind = TransportKind(rawValue: shared.transport) else { return }
-        pendingShare = nil
-        shareApproved = false
-        guard !tunnel.running, !vpn.active else {
-            shareMessage = "Остановите подключение и повторите импорт"
-            return
-        }
-        var next = secureSettings
-        next.url = shared.url
-        next.peerKey = shared.peerKey
-        next.maxToken = ""
-        next.maxUid = ""
-        do {
-            try SharedConnectionSettings.save(next)
-            secureSettings = next
-            transportRaw = kind.rawValue
-            settingsError = nil
-            shareMessage = "Настройки из QR сохранены. Проверьте их и нажмите Start."
-        } catch {
-            shareMessage = "Не удалось сохранить настройки: \(error.localizedDescription)"
+                .disabled(tunnel.running)
         }
     }
 

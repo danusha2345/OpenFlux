@@ -1,7 +1,7 @@
 # OpenFlux iOS app
 
-SwiftUI client that links the OpenFlux Go core (`liboflux.a`). It offers a
-local SOCKS5 proxy and a system VPN through `NEPacketTunnelProvider`.
+SwiftUI client that links the OpenFlux Go core (`liboflux.a`) and runs the
+SOCKS5 tunnel over the Yandex.Docs transport on `127.0.0.1:1080`.
 
 ## Layout
 - `project.yml` — XcodeGen project definition (run `xcodegen generate` to produce `OpenFlux.xcodeproj`).
@@ -10,10 +10,42 @@ local SOCKS5 proxy and a system VPN through `NEPacketTunnelProvider`.
 - `ExportOptions.plist` — App Store export options (team 8GQH8GQ252, automatic signing).
 
 ## Go bridge API (liboflux.h)
-- `OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid)` — start the client (returns 0 on success).
-- `OpenFluxStop()` — stop transport + SOCKS5 listener.
-- `OpenFluxIsRunning()` / `OpenFluxIsConnected()` — state.
-- `OpenFluxStatsJSON()` / `OpenFluxReadLog()` — stats + log tail (free with `OpenFluxFreeString`).
+Built from `mobile/ios` (`./build_ios.sh`) on package `mobile`, the same code
+the Android app runs: Session, KDF context, codec fallback and openflux://
+links behave the same on every client. An app outside this repository links
+this core as a submodule and builds the library with the same script.
+
+Classic profiles (one carrier, as the app has always started them):
+- `OpenFluxSetEncryption(secret)`, `OpenFluxSetCodec(codec)` — for the next start.
+  With a secret the client runs the Session and speaks classic to a node that
+  does not answer it (an older or classic node); without one, classic only.
+- `OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid)` — SOCKS5 client
+  (a comma-separated `url` runs one carrier per document).
+- `OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid)` — Network Extension
+  (`OpenFluxTunWritePacket` / `OpenFluxTunReadPacket`, `OpenFluxPacketTunnelConnected`,
+  `OpenFluxStopPacketTunnel`, `OpenFluxSetTunnelUDP`, `OpenFluxSetGeositeDirect`,
+  `OpenFluxDrainDirectIPs`).
+
+Session profiles (several carriers, what a node's openflux:// link describes):
+- `OpenFluxShareDecode(link)` → `{"config","context","session"}`: `session` is the
+  profile, ready for `OpenFluxStartSession(session, secret, socksAddr)` or
+  `OpenFluxStartSessionPacketTunnel(session, secret)`. Do not interpret the link in
+  Swift: the context and carrier names in it must reach the core unchanged.
+- `OpenFluxShareEncode(configJSON)` → `{"link","config","context"}`: the core fills in
+  the context and drops defaults, so the link is the one every client makes.
+- On failure both return `{"error","code","param"}`: `code` (`share.Code*`, e.g.
+  `damaged`, `unknown_transport`) is what the app words for the user, `param` the value
+  it is about; `error` is English detail for the log.
+
+State and checks:
+- `OpenFluxStop()`, `OpenFluxIsRunning()`, `OpenFluxIsConnected()`, `OpenFluxStatsJSON()`,
+  `OpenFluxMode()` (`session` / `classic`), `OpenFluxActiveTransport()`.
+- `OpenFluxCaptchaPending()` (this phone's carrier), `OpenFluxRemoteCaptchaPending()` and
+  `OpenFluxRemoteCaptchaProxy()` (the exit's), `OpenFluxCaptchaReason()`,
+  `OpenFluxApplyCaptchaCookies(header)` / `OpenFluxOfferCaptchaCookies(header)`,
+  `OpenFluxCancelCaptcha()`, `OpenFluxSetInitialCookies(header)`, `OpenFluxSetCookieStore(path)`.
+- `OpenFluxReadLog()`, `OpenFluxSetDebug(on)`, `OpenFluxSetDebugLevel(0..3)`,
+  `OpenFluxSetDoTResolver(spec)`; free returned strings with `OpenFluxFreeString`.
 
 ## Build + archive + export (one command)
 From the repo root:
@@ -38,36 +70,10 @@ Produces `ios-app/build/export/OpenFlux.ipa`, distribution-signed for the App St
    Or open `ios-app/build/OpenFlux.xcarchive` in Xcode Organizer and use **Distribute App**.
 3. The build appears in TestFlight after Apple processing (a few minutes).
 
-TestFlight installs newer signed beta builds automatically when **Automatic
-Updates** is enabled for OpenFlux in the TestFlight app. The app's About screen
-shows its version and opens the TestFlight page. GitHub's unsigned IPA is only a
-CI artifact and cannot update an installed iPhone app.
-The public beta link in the root README belongs to the original app; publishing
-this fork requires access to its signing and App Store Connect channel or a
-separate signed app record.
-
-The app registers `openflux://noise-v1/` links. Opening a QR link from iPhone
-Camera imports the transport URL and exit public key into the shared Keychain;
-the user reviews the settings before starting the tunnel. Links from upstream's
-AES/session format are rejected.
-
 ## Notes / follow-ups
+- The app runs a **local** SOCKS5 proxy. The in-app **Test** button proves the
+  tunnel carries traffic (fetches the exit IP through the proxy). Routing the
+  whole device requires a Network Extension (`NEPacketTunnelProvider`) target
+  with the Network Extensions capability — not included in this first build.
 - Deployment target: iOS 15.0 (SwiftUI App lifecycle). The Go lib is built with
   `-miphoneos-version-min=13.0`, so it is compatible.
-
-## Хранение настроек и VPN
-
-- URL подключения, данные MAX и публичный ключ Noise находятся в общей группе
-  Keychain приложения и расширения. При первом запуске после обновления
-  приложение переносит данные из UserDefaults и старого VPN-профиля; старые
-  копии удаляются только после успешного сохранения. После перезагрузки iPhone
-  нужно хотя бы раз разблокировать устройство для доступа к этим данным.
-- До установки маршрута по умолчанию расширение определяет IPv4-адреса
-  служебных узлов транспорта и DoT и исключает их из VPN. Для Яндекса также
-  используются его диапазоны из маршрутного плана. На остальных транспортах
-  адрес нового динамического relay может потребовать отдельной проверки.
-- После первой подтверждённой связи расширение выставляет `reasserting` при
-  потере транспорта, сохраняя циклы обработки пакетов.
-- Подписанная сборка на iPhone должна проверить доступ обоих target к Keychain,
-  миграцию, сон и переподключение при смене Wi-Fi/сотовой сети. Локальные
-  Go-проверки не компилируют Swift.

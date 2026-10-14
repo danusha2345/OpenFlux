@@ -5,33 +5,34 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/url"
+	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/net/proxy"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 
-	"openflux/netguard"
-	"openflux/transport"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/netguard"
+	"github.com/p1neappleXpress/OpenFlux/network"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/tunnel/l3"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // ExitMode выбирает, как выходная нода общается с интернетом.
 type ExitMode int
 
 const (
-	ExitModeL3 ExitMode = iota // L3: SNAT/DNAT без gVisor (Linux)
-	ExitModeL4                 // L4: gVisor TCP-терминация + net.Dial (работает везде)
+	ExitModeL3 ExitMode = iota
+	ExitModeL4
 )
 
 func (m ExitMode) String() string {
@@ -43,11 +44,9 @@ func (m ExitMode) String() string {
 	}
 }
 
-// ParseExitMode разбирает строку из флага --mode.
 func ParseExitMode(s string) (ExitMode, error) {
 	switch s {
 	case "", "l4", "proxy":
-		// "proxy" is a deprecated alias kept for one release.
 		return ExitModeL4, nil
 	case "l3":
 		return ExitModeL3, nil
@@ -56,53 +55,60 @@ func ParseExitMode(s string) (ExitMode, error) {
 	}
 }
 
-func parseSOCKS5(proxyStr string) (string, *proxy.Auth, error) {
-	if !strings.Contains(proxyStr, "://") {
-		proxyStr = "socks5://" + proxyStr
-	}
-	u, err := url.Parse(proxyStr)
-	if err != nil {
-		return "", nil, err
-	}
-	var auth *proxy.Auth
-	if u.User != nil {
-		auth = &proxy.Auth{
-			User: u.User.Username(),
-		}
-		if pass, ok := u.User.Password(); ok {
-			auth.Password = pass
-		}
-	}
-	host := u.Host
-	if strings.HasPrefix(host, ":") {
-		host = "127.0.0.1" + host
-	}
-	return host, auth, nil
-}
-
 type TCPTunnel struct {
-	gvisorStack   *stack.Stack
-	tunnelEP      *TunnelLinkEndpoint
-	transport     transport.Transport
-	isExitNode    bool
-	exitMode      ExitMode
-	upstreamProxy string
-	dialer        proxy.Dialer
-	startTime     time.Time
-	packetCount   atomic.Uint64
-	closed        chan struct{}
-	closeOnce     sync.Once
+	gvisorStack *stack.Stack
+	tunnelEP    *TunnelLinkEndpoint
+	transport   transport.Transport
+	isExitNode  bool
+	exitMode    ExitMode
+	startTime   time.Time
+	packetCount atomic.Uint64
+	stopOnce    sync.Once
+	stopCh      chan struct{}
+	udpFlows    atomic.Int32
 }
 
-// TCP buffer size range for gvisor stacks.
 var (
 	TCPBufMin     = 4 * 1024 * 1024
 	TCPBufDefault = 16 * 1024 * 1024
 	TCPBufMax     = 64 * 1024 * 1024
 )
 
-// SetTCPBuffers applies the configured TCP send/receive buffer ranges to s.
-func SetTCPBuffers(s *stack.Stack) {
+// tcpMinRTO is the floor of the tunnel TCP's retransmission timeout. The
+// carriers deliver everything, but not always on time - a relay that holds
+// packets back for a second or three, a striped link waiting for its lanes to
+// come back - and a timeout that fires while the data is merely late costs the
+// connection its whole window: gVisor does not undo a spurious one, and after
+// two or three of them a connection crawls at a few packets per round trip.
+// Real losses (a queue drop) are repaired by SACK and tail loss probes long
+// before this. OPENFLUX_TCP_MIN_RTO_MS.
+var tcpMinRTO = func() time.Duration {
+	if n, err := strconv.Atoi(os.Getenv("OPENFLUX_TCP_MIN_RTO_MS")); err == nil && n > 0 {
+		return time.Duration(n) * time.Millisecond
+	}
+	return 3 * time.Second
+}()
+
+// TuneTCP sets the tunnel TCP's buffers, retransmission timeout floor and loss
+// detection.
+func TuneTCP(s *stack.Stack) {
+	minRTO := tcpip.TCPMinRTOOption(tcpMinRTO)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &minRTO); err != nil {
+		utils.Debugf("[TUNNEL] set min RTO: %v", err)
+	}
+	// Loss detection by duplicate ACKs, not by time (RACK) and no tail loss
+	// probes. A carrier hands packets over in order, only sometimes late, so
+	// a real loss always shows up as duplicate ACKs - while RACK and TLP take
+	// lateness for loss: at the start of every connection the handshake's
+	// quick round trip set their clocks, the first data took a few times
+	// longer, and the spurious "recovery" left CUBIC at a window of 4 for the
+	// next ten seconds. OPENFLUX_TCP_RACK=1 restores gVisor's default.
+	if os.Getenv("OPENFLUX_TCP_RACK") != "1" {
+		recovery := tcpip.TCPRecovery(0)
+		if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &recovery); err != nil {
+			utils.Debugf("[TUNNEL] set loss recovery: %v", err)
+		}
+	}
 	rcv := tcpip.TCPReceiveBufferSizeRangeOption{Min: TCPBufMin, Default: TCPBufDefault, Max: TCPBufMax}
 	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcv); err != nil {
 		utils.Debugf("[TUNNEL] set recv buffer: %v", err)
@@ -113,47 +119,42 @@ func SetTCPBuffers(s *stack.Stack) {
 	}
 }
 
-func NewTCPTunnel(trans transport.Transport, isExitNode bool, upstreamProxy ...string) (*TCPTunnel, error) {
-	proxy := ""
-	if len(upstreamProxy) > 0 {
-		proxy = upstreamProxy[0]
-	}
-	return NewTCPTunnelModeWithProxy(trans, isExitNode, ExitModeL4, proxy)
+func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
+	return NewTCPTunnelMode(trans, isExitNode, ExitModeL4)
 }
 
-func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode) (*TCPTunnel, error) {
-	return NewTCPTunnelModeWithProxy(trans, isExitNode, mode, "")
-}
-
-func NewTCPTunnelModeWithProxy(trans transport.Transport, isExitNode bool, mode ExitMode, upstreamProxy string) (*TCPTunnel, error) {
+func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode) *TCPTunnel {
 	t := &TCPTunnel{
-		transport:     trans,
-		isExitNode:    isExitNode,
-		exitMode:      mode,
-		upstreamProxy: upstreamProxy,
-		startTime:     time.Now(),
+		transport:  trans,
+		isExitNode: isExitNode,
+		exitMode:   mode,
+		startTime:  time.Now(),
+		stopCh:     make(chan struct{}),
 	}
 
 	utils.Debugf("[TUNNEL] Net stack init...")
 	t.gvisorStack = stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcpProtocol(), udp.NewProtocol},
 	})
 
-	SetTCPBuffers(t.gvisorStack)
-
-	// Detect loss only by duplicate ACKs and the RTO, without RACK-TLP. The
-	// document relay delivers every message in order but sometimes holds them
-	// for hundreds of milliseconds; RACK-TLP takes each hold for a loss and
-	// halves the window, and gVisor never undoes that, which kept uploads
-	// through the tunnel at ~100 KB/s.
-	recovery := tcpip.TCPRecovery(0)
-	if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber, &recovery); err != nil {
-		utils.Debugf("[TUNNEL] disable RACK-TLP: %v", err)
-	}
+	TuneTCP(t.gvisorStack)
 
 	tunnelEP := NewTunnelLinkEndpoint()
+	if n, ok := trans.(transport.PeerParameterProvider); ok {
+		if p, ready := n.PeerParameters(); ready {
+			tunnelEP.SetMTU(uint32(min(1500, p.MaxPacketSize)))
+		}
+	}
+	// "->" points towards the internet and "<-" back towards the device on
+	// both sides, as in the L3 and utun logs, so one flow reads the same in
+	// the client's and the exit's log.
+	toPeer, fromPeer := network.DirOutbound, network.DirInbound
+	if isExitNode {
+		toPeer, fromPeer = network.DirInbound, network.DirOutbound
+	}
 	tunnelEP.onOutgoingPacket = func(data []byte) {
+		network.LogPacket("TUNNEL", toPeer, data)
 		if err := trans.Send(data); err != nil {
 			utils.Debugf("[TUNNEL] trans.Send error: %v", err)
 		}
@@ -162,7 +163,7 @@ func NewTCPTunnelModeWithProxy(trans transport.Transport, isExitNode bool, mode 
 
 	tunnelNIC := tcpip.NICID(1)
 	if err := t.gvisorStack.CreateNIC(tunnelNIC, tunnelEP); err != nil {
-		return nil, fmt.Errorf("create NIC: %v", err)
+		utils.Debugf("[TUNNEL] CreateNIC tunnel error: %v", err)
 	}
 
 	if isExitNode {
@@ -172,41 +173,16 @@ func NewTCPTunnelModeWithProxy(trans transport.Transport, isExitNode bool, mode 
 	}
 
 	trans.Receive(func(data []byte) {
+		network.LogPacket("TUNNEL", fromPeer, data)
 		tunnelEP.InjectInbound(data)
 	})
 
-	t.closed = make(chan struct{})
 	utils.SafeGo("tunnel.printStats", t.printStats)
-	return t, nil
+	return t
 }
 
-// ---- exit node: proxy ----
-
 func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
-	baseDialer := &net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-
-	if t.upstreamProxy == "" || strings.ToLower(t.upstreamProxy) == "direct" {
-		t.dialer = baseDialer
-		utils.Debugf("[TUNNEL] EXIT NODE - proxy mode (direct connection, no upstream SOCKS5)")
-	} else {
-		proxyHost, auth, err := parseSOCKS5(t.upstreamProxy)
-		if err != nil {
-			utils.Debugf("[TUNNEL] Invalid upstream proxy %q: %v", t.upstreamProxy, err)
-			t.dialer = baseDialer
-		} else {
-			d, err := proxy.SOCKS5("tcp", proxyHost, auth, baseDialer)
-			if err != nil {
-				utils.Debugf("[TUNNEL] Failed to create SOCKS5 dialer for %s: %v", proxyHost, err)
-				t.dialer = baseDialer
-			} else {
-				t.dialer = d
-				utils.Debugf("[TUNNEL] EXIT NODE - Routing via SOCKS5 proxy %s", proxyHost)
-			}
-		}
-	}
+	utils.Debugf("[TUNNEL] EXIT NODE - proxy mode (no raw sockets)")
 
 	t.gvisorStack.SetPromiscuousMode(tunnelNIC, true)
 	t.gvisorStack.SetSpoofing(tunnelNIC, true)
@@ -217,87 +193,123 @@ func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
 
 	fwd := tcp.NewForwarder(t.gvisorStack, 0, 8192, t.handleExitTCP)
 	t.gvisorStack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
+	udpFwd := udp.NewForwarder(t.gvisorStack, t.handleExitUDP)
+	t.gvisorStack.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
+}
+
+const udpIdleTimeout = 2 * time.Minute
+
+func (t *TCPTunnel) handleExitUDP(r *udp.ForwarderRequest) bool {
+	if netguard.Blocked(net.ParseIP(r.ID().LocalAddress.String())) {
+		return true
+	}
+	if t.udpFlows.Add(1) > 256 {
+		t.udpFlows.Add(-1)
+		return true
+	}
+	id := r.ID()
+	dest := net.JoinHostPort(id.LocalAddress.String(), fmt.Sprintf("%d", id.LocalPort))
+
+	var wq waiter.Queue
+	ep, tErr := r.CreateEndpoint(&wq)
+	if tErr != nil {
+		t.udpFlows.Add(-1)
+		utils.Debugf("[EXIT] UDP CreateEndpoint %s: %v", dest, tErr)
+		return true
+	}
+	local := gonet.NewUDPConn(&wq, ep)
+	remote, err := net.DialTimeout("udp", dest, 10*time.Second)
+	if err != nil {
+		utils.Debugf("[EXIT] UDP dial %s failed: %v", dest, err)
+		local.Close()
+		t.udpFlows.Add(-1)
+		return true
+	}
+
+	utils.SafeGo("exit.udp-flow", func() {
+		defer t.udpFlows.Add(-1)
+		refresh := func() {
+			deadline := time.Now().Add(udpIdleTimeout)
+			_ = local.SetReadDeadline(deadline)
+			_ = remote.SetReadDeadline(deadline)
+		}
+		refresh()
+		var once sync.Once
+		closeBoth := func() {
+			_ = local.Close()
+			_ = remote.Close()
+		}
+		pump := func(dst, src net.Conn) {
+			defer once.Do(closeBoth)
+			buf := make([]byte, 65535)
+			for {
+				n, err := src.Read(buf)
+				if err != nil {
+					return
+				}
+				refresh()
+				_ = dst.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if _, err := dst.Write(buf[:n]); err != nil {
+					return
+				}
+			}
+		}
+		done := make(chan struct{})
+		go func() { defer close(done); pump(remote, local) }()
+		pump(local, remote)
+		<-done
+	})
+	return true
 }
 
 func (t *TCPTunnel) handleExitTCP(r *tcp.ForwarderRequest) {
-	reqID := r.ID()
-	dstIP := net.IP(reqID.LocalAddress.AsSlice())
-	if netguard.Blocked(dstIP) {
-		utils.Debugf("[EXIT] refused blocked destination %s (use --allow-private to permit)", dstIP)
+	if netguard.Blocked(net.ParseIP(r.ID().LocalAddress.String())) {
 		r.Complete(true)
 		return
 	}
-	dest := net.JoinHostPort(dstIP.String(), strconv.Itoa(int(reqID.LocalPort)))
+	id := r.ID()
+	dest := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
+
+	var wq waiter.Queue
+	ep, tErr := r.CreateEndpoint(&wq)
+	if tErr != nil {
+		utils.Debugf("[EXIT] CreateEndpoint %s: %v", dest, tErr)
+		r.Complete(true)
+		return
+	}
+	r.Complete(false)
+	local := gonet.NewTCPConn(&wq, ep)
 
 	utils.SafeGo("exit.flow", func() {
-		dialer := t.dialer
-		if dialer == nil {
-			dialer = &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		var remote net.Conn
-		var err error
-		if cd, ok := dialer.(proxy.ContextDialer); ok {
-			remote, err = cd.DialContext(ctx, "tcp", dest)
-		} else {
-			remote, err = dialer.Dial("tcp", dest)
-		}
-
+		remote, err := net.DialTimeout("tcp", dest, 10*time.Second)
 		if err != nil {
 			utils.Debugf("[EXIT] dial %s failed: %v", dest, err)
-			r.Complete(true)
+			local.Close()
 			return
 		}
-		defer remote.Close()
-
-		var wq waiter.Queue
-		ep, tErr := r.CreateEndpoint(&wq)
-		if tErr != nil {
-			utils.Debugf("[EXIT] CreateEndpoint %s: %v", dest, tErr)
-			r.Complete(true)
-			return
-		}
-		r.Complete(false)
-
-		local := gonet.NewTCPConn(&wq, ep)
-		defer local.Close()
-
 		if tc, ok := remote.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
-			_ = tc.SetReadBuffer(16 * 1024 * 1024)
-			_ = tc.SetWriteBuffer(16 * 1024 * 1024)
+			// No SO_RCVBUF / SO_SNDBUF: setting one turns the kernel's
+			// buffer autotuning off for the socket and is cut to
+			// net.core.[rw]mem_max - 208 KB on a stock Linux. A Telemost exit
+			// that asked for 16 MB got 416 KB and fetched from the internet
+			// at 1.4 MB/s over a 50 ms path (42 MB/s left alone), which capped
+			// every download through it.
 		}
 		utils.Debugf("[EXIT] %s connected", dest)
 
-		var wg sync.WaitGroup
-		wg.Add(2)
-
 		go func() {
-			defer wg.Done()
 			buf := make([]byte, 256*1024)
-			_, _ = io.CopyBuffer(remote, local, buf)
-			halfClose(remote)
-			remote.SetReadDeadline(time.Now().Add(halfCloseLinger))
+			io.CopyBuffer(remote, local, buf)
+			remote.Close()
+			local.Close()
 		}()
-
-		go func() {
-			defer wg.Done()
-			buf := make([]byte, 256*1024)
-			_, _ = io.CopyBuffer(local, remote, buf)
-			// Half-close: let the local->remote direction keep flowing after
-			// the server stops sending, instead of tearing the flow down.
-			halfClose(local)
-			local.SetReadDeadline(time.Now().Add(halfCloseLinger))
-		}()
-
-		wg.Wait()
+		buf := make([]byte, 256*1024)
+		io.CopyBuffer(local, remote, buf)
+		local.Close()
+		remote.Close()
 	})
 }
-
-// ---- client ----
 
 func (t *TCPTunnel) setupClient(tunnelNIC tcpip.NICID) {
 	clientAddr := tcpip.AddrFrom4([4]byte{10, 10, 10, 2})
@@ -315,39 +327,91 @@ func (t *TCPTunnel) setupClient(tunnelNIC tcpip.NICID) {
 	})
 }
 
-// A disconnected carrier cannot answer the SYN; bound the wait seen by
-// SOCKS5 and mobile callers.
 var dialTimeout = 10 * time.Second
 
 func (t *TCPTunnel) DialTCP(address string) (net.Conn, error) {
-	tcpAddr, err := net.ResolveTCPAddr("tcp", address)
+	host, portStr, err := net.SplitHostPort(address)
 	if err != nil {
-		return nil, fmt.Errorf("resolve: %w", err)
+		return nil, fmt.Errorf("split address: %w", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 0 || port > 65535 {
+		return nil, fmt.Errorf("bad port in %q", address)
 	}
 
-	ip := tcpAddr.IP.To4()
-	if ip == nil {
-		return nil, fmt.Errorf("IPv6 not supported")
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	ip, err := t.resolveIPv4(ctx, host)
+	if err != nil {
+		return nil, err
 	}
-	utils.Debugf("[TUNNEL] DialTCP %s -> %s:%d", address, ip.String(), tcpAddr.Port)
+	utils.Debugf("[TUNNEL] DialTCP %s -> %s:%d", address, ip.String(), port)
 
 	nic := tcpip.NICID(1)
 	if t.isExitNode && false {
 		nic = tcpip.NICID(2)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
 	conn, err := gonet.DialContextTCP(ctx, t.gvisorStack, tcpip.FullAddress{
 		NIC:  nic,
 		Addr: tcpip.AddrFrom4([4]byte{ip[0], ip[1], ip[2], ip[3]}),
-		Port: uint16(tcpAddr.Port),
+		Port: uint16(port),
 	}, ipv4.ProtocolNumber)
-
 	if err != nil {
-		return nil, err // avoid a typed nil *TCPConn in a non-nil net.Conn
+		return nil, err
 	}
 	return conn, nil
+}
+
+// Resolve application names through the exit, not through the host resolver.
+// This also avoids leaking DNS and passing another VPN's fake IPs to the exit.
+func (t *TCPTunnel) resolveIPv4(ctx context.Context, host string) (net.IP, error) {
+	return resolveRemoteIPv4(ctx, host, func(ctx context.Context, network, address string) (net.Conn, error) {
+		return gonet.DialContextTCP(ctx, t.gvisorStack, tcpip.FullAddress{
+			NIC: 1, Addr: tcpip.AddrFrom4([4]byte{1, 1, 1, 1}), Port: 53,
+		}, ipv4.ProtocolNumber)
+	})
+}
+
+func resolveRemoteIPv4(ctx context.Context, host string, dial func(context.Context, string, string) (net.Conn, error)) (net.IP, error) {
+	if literal := net.ParseIP(host); literal != nil {
+		if ip := literal.To4(); ip != nil {
+			return ip, nil
+		}
+		return nil, fmt.Errorf("IPv6 not supported")
+	}
+	resolver := net.Resolver{PreferGo: true, Dial: dial}
+	ips, err := resolver.LookupIP(ctx, "ip4", host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve through exit: %w", err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no IPv4 address for %s", host)
+	}
+	return ips[0].To4(), nil
+}
+
+func (t *TCPTunnel) DialUDP(address string) (net.Conn, error) {
+	host, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("bad UDP port")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	ip, err := t.resolveIPv4(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	remote := &tcpip.FullAddress{
+		NIC:  1,
+		Addr: tcpip.AddrFrom4([4]byte{ip[0], ip[1], ip[2], ip[3]}),
+		Port: uint16(port),
+	}
+	return gonet.DialUDP(t.gvisorStack, nil, remote, ipv4.ProtocolNumber)
 }
 
 func (t *TCPTunnel) ListenTCP(port uint16) (net.Listener, error) {
@@ -357,38 +421,52 @@ func (t *TCPTunnel) ListenTCP(port uint16) (net.Listener, error) {
 	}, ipv4.ProtocolNumber)
 }
 
+func (t *TCPTunnel) Close() {
+	t.stopOnce.Do(func() {
+		close(t.stopCh)
+		t.gvisorStack.Close()
+	})
+}
+
 func (t *TCPTunnel) printStats() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-t.closed:
+		case <-t.stopCh:
 			return
 		case <-ticker.C:
+			tcp := t.gvisorStack.Stats().TCP
+			utils.Packetf("[STATS] uptime=%v mode=%s established=%d segs=%d retrans=%d fastRetx=%d sackRec=%d tlp=%d timeouts=%d spuriousRTO=%d",
+				time.Since(t.startTime).Round(time.Second), t.exitMode.String(),
+				tcp.CurrentEstablished.Value(), tcp.SegmentsSent.Value(), tcp.Retransmits.Value(),
+				tcp.FastRetransmit.Value(), tcp.SACKRecovery.Value(), tcp.TLPRecovery.Value(),
+				tcp.Timeouts.Value(), tcp.SpuriousRTORecovery.Value())
+			t.logBusiestFlow()
 		}
-		stats := t.gvisorStack.Stats()
-		utils.Debugf("[STATS] uptime=%v mode=%s packets=%d connected=%d established=%d retrans=%d",
-			time.Since(t.startTime).Round(time.Second),
-			t.exitMode.String(),
-			t.packetCount.Load(),
-			stats.TCP.CurrentConnected.Value(),
-			stats.TCP.CurrentEstablished.Value(),
-			stats.TCP.Retransmits.Value(),
-		)
 	}
 }
 
-// Close releases the gVisor stack and stops the stats goroutine. Safe to call
-// more than once.
-func (t *TCPTunnel) Close() error {
-	t.closeOnce.Do(func() {
-		if t.closed != nil {
-			close(t.closed)
+// logBusiestFlow logs the congestion state of the connection with the
+// largest window - the one a download runs on.
+func (t *TCPTunnel) logBusiestFlow() {
+	var best tcpip.TCPInfoOption
+	for _, te := range t.gvisorStack.RegisteredEndpoints() {
+		ep, ok := te.(tcpip.Endpoint)
+		if !ok {
+			continue
 		}
-		if t.gvisorStack != nil {
-			t.gvisorStack.Close()
+		var info tcpip.TCPInfoOption
+		if ep.GetSockOpt(&info) == nil && info.SndCwnd > best.SndCwnd {
+			best = info
 		}
-	})
-	return nil
+	}
+	if best.SndCwnd > 0 {
+		utils.Packetf("[STATS] busiest flow: cwnd=%d ssthresh=%d rtt=%s rttvar=%s rto=%s",
+			best.SndCwnd, best.SndSsthresh, best.RTT.Round(time.Millisecond),
+			best.RTTVar.Round(time.Millisecond), best.RTO.Round(time.Millisecond))
+	}
 }
+
+func SetLocalIP(ip string) error { return l3.SetLocalIP(ip) }

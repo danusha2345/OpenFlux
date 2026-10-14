@@ -31,12 +31,17 @@ type TransportStats struct {
 	Reconnects    uint64
 	Connected     bool
 	Uptime        time.Duration
-	// LastRecv is when anything last arrived from the remote peer: a data
-	// frame or a transport-level keepalive. Zero if nothing has arrived yet,
-	// or since the transport learned that the peer left.
-	// MultiStreamTransport uses it to tell a stream that is merely connected
-	// to its relay from one that actually reaches the peer.
-	LastRecv time.Time
+}
+
+// BatchSizeHinter is an optional interface a transport implements to raise the
+// default coalescing batch size for its carrier. A carrier capped by the number
+// of messages per connection rather than by bytes wants each message as large
+// as possible: the Mail.ru docs chat channel, for instance, is cut by the
+// server's anti-abuse after ~12 messages regardless of their size, so a small
+// batch wastes most of the per-connection budget. newLink passes the hint to
+// NewBatchedTransport; OPENFLUX_BATCH_BYTES still overrides it.
+type BatchSizeHinter interface {
+	PreferredBatchBytes() int
 }
 
 func DefaultConfig() TransportConfig {
@@ -55,34 +60,54 @@ type BaseTransport struct {
 	connected atomic.Int32
 	stats     TransportStats
 	startTime time.Time
-	startMu   sync.RWMutex
 
 	receiveCallback func([]byte)
 	Mu              sync.RWMutex
 
 	reconnectAttempts atomic.Int32
-	lastRecv          atomic.Int64 // unix nanos; 0 = never
+
+	// done is closed by Stop. Subclasses can select on Done() to
+	// interrupt sleeps and backoff loops.
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 func NewBaseTransport(config TransportConfig) *BaseTransport {
 	return &BaseTransport{
 		config:    config,
 		startTime: time.Now(),
+		done:      make(chan struct{}),
 	}
 }
 
 func (b *BaseTransport) Start() error {
-	b.startMu.Lock()
-	b.startTime = time.Now()
-	b.startMu.Unlock()
+	b.doneOnce = sync.Once{}
+	b.done = make(chan struct{})
 	b.running.Store(1)
+	b.startTime = time.Now()
 	return nil
 }
 
 func (b *BaseTransport) Stop() error {
 	b.running.Store(0)
 	b.connected.Store(0)
+	if b.done != nil {
+		b.doneOnce.Do(func() { close(b.done) })
+	}
 	return nil
+}
+
+// Done returns a channel that closes when the transport is stopped.
+// Subclasses and callers can select on it to interrupt sleeps.
+func (b *BaseTransport) Done() <-chan struct{} {
+	b.Mu.RLock()
+	d := b.done
+	b.Mu.RUnlock()
+	if d == nil {
+		// Never started; return a channel that blocks forever.
+		return make(chan struct{})
+	}
+	return d
 }
 
 func (b *BaseTransport) IsRunning() bool {
@@ -123,9 +148,6 @@ func (b *BaseTransport) GetSession(accessor func(interface{})) {
 }
 
 func (b *BaseTransport) Stats() TransportStats {
-	b.startMu.RLock()
-	startTime := b.startTime
-	b.startMu.RUnlock()
 	return TransportStats{
 		BytesSent:     atomic.LoadUint64(&b.stats.BytesSent),
 		BytesReceived: atomic.LoadUint64(&b.stats.BytesReceived),
@@ -133,18 +155,8 @@ func (b *BaseTransport) Stats() TransportStats {
 		PacketsRecv:   atomic.LoadUint64(&b.stats.PacketsRecv),
 		Reconnects:    uint64(b.reconnectAttempts.Load()),
 		Connected:     b.IsConnected(),
-		Uptime:        time.Since(startTime),
-		LastRecv:      b.LastRecv(),
+		Uptime:        time.Since(b.startTime),
 	}
-}
-
-// LastRecv reports when the peer was last heard from (see TransportStats).
-func (b *BaseTransport) LastRecv() time.Time {
-	ns := b.lastRecv.Load()
-	if ns == 0 {
-		return time.Time{}
-	}
-	return time.Unix(0, ns)
 }
 
 func (b *BaseTransport) RecordSend(bytes int) {
@@ -155,19 +167,6 @@ func (b *BaseTransport) RecordSend(bytes int) {
 func (b *BaseTransport) RecordReceive(bytes int) {
 	atomic.AddUint64(&b.stats.BytesReceived, uint64(bytes))
 	atomic.AddUint64(&b.stats.PacketsRecv, 1)
-	b.RecordPeerActivity()
-}
-
-// RecordPeerActivity marks the peer as heard from without counting a data
-// frame, for transport-level keepalives that carry no tunnel payload.
-func (b *BaseTransport) RecordPeerActivity() {
-	b.lastRecv.Store(time.Now().UnixNano())
-}
-
-// ForgetPeer clears LastRecv when the transport learns that the peer has left,
-// so the peer counts as not heard from until it sends again.
-func (b *BaseTransport) ForgetPeer() {
-	b.lastRecv.Store(0)
 }
 
 func (b *BaseTransport) RecordReconnect() {

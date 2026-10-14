@@ -7,8 +7,8 @@ options:
 
 settings:
   base:
-    MARKETING_VERSION: "1.1.2"
-    CURRENT_PROJECT_VERSION: "20"
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "17"
     DEVELOPMENT_TEAM: "8GQH8GQ252"
 
 targets:
@@ -17,7 +17,6 @@ targets:
     platform: iOS
     sources:
       - path: OpenFlux
-      - path: Shared
       - path: Lib
         buildPhase: none
     dependencies:
@@ -30,10 +29,6 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
-        CFBundleURLTypes:
-          - CFBundleURLName: com.p1neapplexpress-saharev.openflux.share
-            CFBundleURLSchemes:
-              - openflux
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
@@ -45,8 +40,6 @@ targets:
       properties:
         com.apple.developer.networking.networkextension:
           - packet-tunnel-provider
-        keychain-access-groups:
-          - "$(AppIdentifierPrefix)com.p1neapplexpress-saharev.openflux"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.p1neapplexpress-saharev.openflux
@@ -74,7 +67,6 @@ targets:
     platform: iOS
     sources:
       - path: OpenFluxTunnel
-      - path: Shared
       - path: Lib
         buildPhase: none
     dependencies:
@@ -94,8 +86,6 @@ targets:
       properties:
         com.apple.developer.networking.networkextension:
           - packet-tunnel-provider
-        keychain-access-groups:
-          - "$(AppIdentifierPrefix)com.p1neapplexpress-saharev.openflux"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.p1neapplexpress-saharev.openflux.tunnel

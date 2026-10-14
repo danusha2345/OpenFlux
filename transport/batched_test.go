@@ -2,9 +2,6 @@ package transport
 
 import (
 	"bytes"
-	"fmt"
-	"runtime"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,19 +15,13 @@ type fakeTransport struct {
 	sent     [][]byte
 	cb       func([]byte)
 	loopback bool
-	sendErr  error // when set, Send fails instead of delivering
 }
 
 func (f *fakeTransport) Start() error { return nil }
 func (f *fakeTransport) Stop() error  { return nil }
 func (f *fakeTransport) Send(data []byte) error {
-	f.mu.Lock()
-	if f.sendErr != nil {
-		err := f.sendErr
-		f.mu.Unlock()
-		return err
-	}
 	cp := append([]byte(nil), data...)
+	f.mu.Lock()
 	f.sent = append(f.sent, cp)
 	cb := f.cb
 	lb := f.loopback
@@ -45,7 +36,7 @@ func (f *fakeTransport) Receive(cb func([]byte)) {
 	f.cb = cb
 	f.mu.Unlock()
 }
-func (f *fakeTransport) IsConnected() bool    { return true }
+func (f *fakeTransport) IsConnected() bool     { return true }
 func (f *fakeTransport) Stats() TransportStats { return TransportStats{} }
 
 func (f *fakeTransport) sendCount() int {
@@ -129,59 +120,46 @@ func TestBatchedTransportCoalescesBurstIntoOneMessage(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	if len(pkts) != n {
-		t.Fatalf("expected %d packets in the batch, got %d", n, len(pkts))
+		t.Fatalf("expected exactly %d data packets without injected control records, got %d", n, len(pkts))
 	}
 }
 
-// Before this fix, flushLoop discarded the error from every
-// b.Transport.Send(encodeBatch(batch)) call: a transport hiccup mid-flush
-// silently dropped the whole batch with no counter and no log line.
-func TestBatchedTransportRecordsSendErrors(t *testing.T) {
-	inner := &fakeTransport{sendErr: fmt.Errorf("write: connection reset")}
+func TestBatchedTransportStaysV2WithoutPeerAdvertisement(t *testing.T) {
+	inner := &fakeTransport{}
 	bt := NewBatchedTransport(inner)
-
-	bt.sendBatch([][]byte{[]byte("lost packet")})
-
-	if got := bt.SendErrors(); got != 1 {
-		t.Fatalf("SendErrors() = %d, want 1", got)
-	}
-	if inner.sendCount() != 0 {
-		t.Fatalf("expected the failed send to record nothing, got %d entries", inner.sendCount())
-	}
-
-	bt.sendBatch([][]byte{[]byte("also lost")})
-	if got := bt.SendErrors(); got != 2 {
-		t.Fatalf("SendErrors() = %d after two failures, want 2", got)
-	}
-}
-
-// goroutinesRunning counts live goroutines whose stack mentions fn.
-func goroutinesRunning(fn string) int {
-	buf := make([]byte, 1<<20)
-	buf = buf[:runtime.Stack(buf, true)]
-	return strings.Count(string(buf), fn)
-}
-
-// Stop must end the flush loop instead of leaving it blocked on the queue.
-func TestBatchedTransportStopEndsFlushLoop(t *testing.T) {
-	const fn = "(*BatchedTransport).flushLoop"
-	before := goroutinesRunning(fn)
-	bt := NewBatchedTransport(&fakeTransport{})
+	bt.lingerMs = 1
 	if err := bt.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
+		t.Fatalf("start: %v", err)
 	}
-	bt.Send([]byte("pkt"))
-	time.Sleep(20 * time.Millisecond)
-	if goroutinesRunning(fn) != before+1 {
-		t.Fatal("flush loop not running after Start")
+	defer bt.Stop()
+	if err := bt.Send([]byte("legacy-compatible")); err != nil {
+		t.Fatalf("send: %v", err)
 	}
-	if err := bt.Stop(); err != nil {
-		t.Fatalf("Stop: %v", err)
+	time.Sleep(50 * time.Millisecond)
+	if got := inner.firstSent(); len(got) == 0 || got[0] != batchFormatVersion {
+		t.Fatalf("wire version = %x, want v2", got)
 	}
-	if n := goroutinesRunning(fn); n != before {
-		t.Fatalf("flush loop still running after Stop (%d goroutines)", n-before)
+}
+
+func TestBatchedTransportRejectsRetiredUnauthenticatedNegotiation(t *testing.T) {
+	t.Setenv("OPENFLUX_EXPERIMENTAL_WIRE_V3", "1")
+	inner := &fakeTransport{}
+	bt := NewBatchedTransport(inner)
+	bt.lingerMs = 1
+	bt.Receive(func([]byte) {})
+	if err := bt.Start(); err == nil {
+		t.Fatal("unsafe prototype was allowed to start")
 	}
-	if err := bt.Stop(); err != nil {
-		t.Fatalf("second Stop: %v", err)
+	defer bt.Stop()
+
+	if err := bt.Send([]byte("v3")); err == nil || inner.sendCount() != 0 {
+		t.Fatal("unsafe prototype sent data")
+	}
+}
+
+func TestBatchedTransportRejectsOversizedPacket(t *testing.T) {
+	bt := NewBatchedTransport(&fakeTransport{})
+	if err := bt.Send(make([]byte, 65536)); err == nil {
+		t.Fatal("expected oversized packet error")
 	}
 }

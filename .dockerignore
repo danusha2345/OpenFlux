@@ -4,14 +4,11 @@
 .gitignore
 .idea
 .claude
-.jj
-.codegraph
-codegraph.json
-docs/
 
 # Prebuilt binaries — never belong in the image.
-universal-bypass-tool
-universal-bypass-tool-*
+openflux
+oflx
+oflx-new
 output/
 
 # Mobile client sources & scripts — not part of the linux binary.

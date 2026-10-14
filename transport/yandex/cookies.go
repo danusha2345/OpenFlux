@@ -15,13 +15,6 @@ import (
 // jar. Only yandex.ru and its subdomains are accepted; cookie values are never
 // included in error messages.
 func loadYandexCookies(path string, jar http.CookieJar) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("stat Yandex cookie file: %w", err)
-	}
-	if info.Mode().Perm()&0077 != 0 {
-		return fmt.Errorf("Yandex cookie file must be accessible only by its owner (mode 0600)")
-	}
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open Yandex cookie file: %w", err)
@@ -43,7 +36,7 @@ func loadYandexCookies(path string, jar http.CookieJar) error {
 		}
 		rawDomain := strings.TrimPrefix(fields[0], "#HttpOnly_")
 		domain := strings.ToLower(strings.TrimPrefix(rawDomain, "."))
-		if !allowedYandexHost(domain) {
+		if domain != "yandex.ru" && !strings.HasSuffix(domain, ".yandex.ru") {
 			continue
 		}
 		if fields[1] != "TRUE" && fields[1] != "FALSE" {

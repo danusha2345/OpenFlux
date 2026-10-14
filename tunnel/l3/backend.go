@@ -3,35 +3,53 @@ package l3
 import (
 	"fmt"
 	"net"
+	"sync"
 )
 
 var errBackendUnavailable = fmt.Errorf("l3: no raw packet backend on this platform")
 
-// localIPOverride, when set via SetLocalIP, is used as the egress IPv4
-// address instead of auto-detecting it.
-var localIPOverride string
+var localIPOverride [4]byte
+var hasLocalIPOverride bool
+var localIPMu sync.Mutex
 
-// SetLocalIP overrides the auto-detected egress IP the L3 raw-socket
-// backend uses for SNAT/DNAT and the return-packet filter (the --local-ip
-// CLI flag). Must be called before New(). Platform-independent: harmless
-// (and unused) on platforms without an L3 backend.
-func SetLocalIP(ip string) { localIPOverride = ip }
-
-// resolveEgressIP returns localIPOverride, parsed as an IPv4 address, if
-// one was set via SetLocalIP; otherwise it calls detect to auto-detect the
-// egress IP. Factored out of the platform-specific backend so the override
-// logic itself is testable without a real raw socket.
-func resolveEgressIP(detect func() ([4]byte, error)) ([4]byte, error) {
-	if localIPOverride == "" {
-		return detect()
+// SetLocalIP configures the source address used by the L3 backend. Passing an
+// empty string restores automatic egress address detection.
+func SetLocalIP(value string) error {
+	localIPMu.Lock()
+	defer localIPMu.Unlock()
+	if value == "" {
+		hasLocalIPOverride = false
+		localIPOverride = [4]byte{}
+		return nil
 	}
-	ip := net.ParseIP(localIPOverride).To4()
+	ip := net.ParseIP(value).To4()
 	if ip == nil {
-		return [4]byte{}, fmt.Errorf("l3: invalid --local-ip %q", localIPOverride)
+		return fmt.Errorf("l3: invalid IPv4 local address %q", value)
 	}
-	var out [4]byte
-	copy(out[:], ip)
-	return out, nil
+	copy(localIPOverride[:], ip)
+	hasLocalIPOverride = true
+	return nil
+}
+
+// egressIPv4 is the --local-ip override, else the address the default route
+// leaves from.
+func egressIPv4() ([4]byte, error) {
+	localIPMu.Lock()
+	egress, ok := localIPOverride, hasLocalIPOverride
+	localIPMu.Unlock()
+	if ok {
+		return egress, nil
+	}
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return [4]byte{}, fmt.Errorf("l3: detect egress: %w", err)
+	}
+	defer conn.Close()
+	ip := conn.LocalAddr().(*net.UDPAddr).IP.To4()
+	if ip == nil {
+		return [4]byte{}, fmt.Errorf("l3: no IPv4 egress address")
+	}
+	return [4]byte(ip), nil
 }
 
 // L3Backend is the platform-specific raw IPv4 I/O.

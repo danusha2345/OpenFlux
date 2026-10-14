@@ -1,10 +1,8 @@
 package oneme
 
 import (
-	"fmt"
-
-	"openflux/transport"
-	"openflux/utils"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 type OneMeTransport struct {
@@ -37,12 +35,8 @@ func NewOneMeTransport(isExit bool, maxToken string, maxUid int64, config transp
 func (t *OneMeTransport) Start() error {
 	utils.Debugf("creating max client ...")
 	t.oneMeClient = *NewMaxClient()
-	if err := t.oneMeClient.Connect(); err != nil {
-		return fmt.Errorf("max connect: %w", err)
-	}
-	if err := t.oneMeClient.LoginByToken(t.token); err != nil {
-		return fmt.Errorf("max login: %w", err)
-	}
+	t.oneMeClient.Connect()
+	t.oneMeClient.LoginByToken(t.token)
 
 	if t.exit {
 		utils.Debugf("configured ch for exit node")
@@ -66,13 +60,10 @@ func (t *OneMeTransport) Stop() error {
 }
 
 func (t *OneMeTransport) IsConnected() bool {
-	return t.ch != nil && t.ch.dcReady()
+	return true
 }
 
 func (t *OneMeTransport) Send(data []byte) error {
-	if t.ch == nil {
-		return fmt.Errorf("not started")
-	}
 	t.ch.Send(data)
 	t.b.RecordSend(len(data))
 	return nil

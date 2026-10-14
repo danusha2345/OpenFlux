@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"net/netip"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/tun"
+	"golang.zx2c4.com/wireguard/windows/tunnel/firewall"
 
 	"github.com/p1neappleXpress/OpenFlux/netbind"
 	"github.com/p1neappleXpress/OpenFlux/transport"
@@ -41,11 +43,13 @@ const (
 var adapterGUID = windows.GUID{Data1: 0x0f1f10ec, Data2: 0x0de5, Data3: 0x4b3a, Data4: [8]byte{0x9c, 0x4e, 0x0f, 0x1f, 0x10, 0xec, 0x5d, 0x01}}
 
 type TUNClient struct {
-	trans transport.Transport
-	dev   tun.Device
-	name  string
-	index uint32
-	mtu   int
+	trans           transport.Transport
+	dev             tun.Device
+	name            string
+	index           uint32
+	luid            uint64
+	firewallEnabled bool
+	mtu             int
 
 	physical uint32
 
@@ -69,6 +73,7 @@ func NewTUNClient(trans transport.Transport, mtu int) (*TUNClient, error) {
 			return nil, fmt.Errorf("адаптер Wintun: %w", err)
 		}
 		c.index = row.InterfaceIndex
+		c.luid = native.LUID()
 	}
 	if c.index == 0 {
 		dev.Close()
@@ -108,14 +113,26 @@ func (c *TUNClient) SetupInterface() error {
 			return err
 		}
 	}
-	// IPv6 only to drop it; a system without IPv6 is fine as well.
-	_ = netsh("interface", "ipv6", "add", "address", "interface="+idx, "address="+localIPv6, "store=active")
+	// A failed IPv6 setup must never leave a supposedly protected tunnel.
+	if err := netsh("interface", "ipv6", "add", "address", "interface="+idx, "address="+localIPv6, "store=active"); err != nil {
+		return err
+	}
+	if err := netsh("interface", "ipv4", "set", "dnsservers", "name="+idx, "source=static", "address=1.1.1.1", "validate=no"); err != nil {
+		return err
+	}
 	return nil
 }
 
 // ConfigureDefault takes the default route: two /1 routes beat 0.0.0.0/0
 // without touching it, so the real default stays for the bound sockets.
 func (c *TUNClient) ConfigureDefault() error {
+	// Dynamic WFP filters block physical-interface bypass, including WebRTC,
+	// even when another adapter has a more specific route. The OS removes
+	// these filters if the process dies; no persistent firewall changes.
+	if err := firewall.EnableFirewall(c.luid, false, []netip.Addr{netip.MustParseAddr("1.1.1.1")}); err != nil {
+		return fmt.Errorf("защита от утечек WFP: %w", err)
+	}
+	c.firewallEnabled = true
 	idx := strconv.Itoa(int(c.index))
 	for _, prefix := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
 		if err := netsh("interface", "ipv4", "add", "route", "prefix="+prefix, "interface="+idx, "nexthop="+peerIPv4, "metric=1", "store=active"); err != nil {
@@ -123,7 +140,9 @@ func (c *TUNClient) ConfigureDefault() error {
 		}
 	}
 	for _, prefix := range []string{"::/1", "8000::/1"} {
-		_ = netsh("interface", "ipv6", "add", "route", "prefix="+prefix, "interface="+idx, "metric=1", "store=active")
+		if err := netsh("interface", "ipv6", "add", "route", "prefix="+prefix, "interface="+idx, "metric=1", "store=active"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -185,7 +204,12 @@ func (c *TUNClient) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
-	return c.dev.Close()
+	err := c.dev.Close()
+	if c.firewallEnabled {
+		firewall.DisableFirewall()
+		c.firewallEnabled = false
+	}
+	return err
 }
 
 // RestoreDefault has nothing left to do: the routes went with the adapter.

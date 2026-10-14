@@ -12,6 +12,8 @@ import (
 	godebug "runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/p1neappleXpress/OpenFlux/netbind"
@@ -30,10 +32,12 @@ import (
 )
 
 var (
-	globalDocUrl string
-	maxToken     string
-	maxUid       string
-	localIP      string
+	globalDocUrl          string
+	maxToken              string
+	maxUid                string
+	localIP               string
+	requiresTUNProtection bool
+	tunProtectionReady    atomic.Bool
 )
 
 // expandShortFlags rewrites single-letter flag aliases into their long
@@ -662,10 +666,12 @@ DEPRECATED (removed in v2)
 		log.Fatalf("unknown --role=%q (want client|exit|bench-send|bench-sink)", *role)
 	}
 
+	requiresTUNProtection = *role == roleClient && *inbound == inboundTUN
+
 	// Windows full tunnel: bind the core's sockets to the real interface
 	// before any transport dials, so the carriers stay out of the tunnel
 	// once it takes the default route (see package netbind).
-	if *role == roleClient && *inbound == inboundTUN && runtime.GOOS == "windows" {
+	if *role == roleClient && *inbound == inboundTUN && (runtime.GOOS == "windows" || runtime.GOOS == "linux") {
 		index, err := netbind.BindDefault()
 		if err != nil {
 			log.Fatalf("tun: %v", err)
@@ -1211,7 +1217,7 @@ func ipcStatusLoop(srv *ipc.Server, src statusSource, active func() string, acti
 		st := src.Stats()
 		p := &ipc.StatusPayload{
 			Running:   true,
-			Connected: src.IsConnected(),
+			Connected: src.IsConnected() && (!requiresTUNProtection || tunProtectionReady.Load()),
 			BytesIn:   st.BytesReceived,
 			BytesOut:  st.BytesSent,
 			UptimeMs:  time.Since(started).Milliseconds(),
@@ -1378,34 +1384,55 @@ func runClientTUN(trans transport.Transport) {
 	// Save the CURRENT default (which may be another VPN's utun) so
 	// we can restore it on exit no matter what.
 	if err := tc.SaveDefault(); err != nil {
+		_ = tc.Close()
 		log.Fatalf("save default route: %v", err)
 	}
 	if err := tc.SetupInterface(); err != nil {
-		log.Fatalf("setup utun (need sudo): %v", err)
+		_ = tc.Close()
+		log.Fatalf("setup TUN: %v", err)
 	}
 	log.Printf("utun up; bypass gateway is %s", tc.Gateway())
 
+	var setupMu sync.Mutex
+	var stopping atomic.Bool
+	setupFailed := make(chan error, 1)
 	watcher := NewSocketWatcher(tc.Gateway(), func() {
+		setupMu.Lock()
+		defer setupMu.Unlock()
+		if stopping.Load() {
+			return
+		}
 		log.Printf("Socket set stable; taking default route into the tunnel")
 		if err := tc.ConfigureDefault(); err != nil {
-			log.Printf("FATAL: configure default: %v", err)
+			setupFailed <- err
 			return
 		}
 		tc.Start()
+		tunProtectionReady.Store(true)
 		log.Printf("Tunnel active")
 	})
 	watcher.Start(2 * time.Second)
 
 	sigCh := make(chan os.Signal, 1)
 	notifySignals(sigCh)
-	<-sigCh
+	var setupErr error
+	select {
+	case <-sigCh:
+	case setupErr = <-setupFailed:
+	}
+	tunProtectionReady.Store(false)
+	stopping.Store(true)
 	watcher.Stop()
+	setupMu.Lock()
 	log.Printf("Shutting down, restoring default route...")
 	if err := tc.Close(); err != nil {
 		log.Printf("cleanup warning: %v", err)
 	}
 	tc.RestoreDefault()
 	log.Printf("Shutdown complete")
+	if setupErr != nil {
+		log.Fatalf("configure full tunnel: %v", setupErr)
+	}
 	os.Exit(0)
 }
 

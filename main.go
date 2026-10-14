@@ -235,6 +235,13 @@ func managerRefreshLoop(m *manager.Manager) {
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--check-windows-tun" {
+		if err := checkWindowsTUN(); err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
+	}
 	// The desktop wizard's JSON protocol owns stdout: no banner, no flags.
 	if len(os.Args) == 2 && os.Args[1] == "--node-wizard" {
 		os.Exit(runNodeWizard(os.Stdin, os.Stdout))

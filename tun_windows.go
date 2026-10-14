@@ -12,9 +12,9 @@ import (
 	"syscall"
 	"time"
 
+	firewall "github.com/p1neappleXpress/OpenFlux/internal/winfirewall"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/tun"
-	"golang.zx2c4.com/wireguard/windows/tunnel/firewall"
 
 	"github.com/p1neappleXpress/OpenFlux/netbind"
 	"github.com/p1neappleXpress/OpenFlux/transport"

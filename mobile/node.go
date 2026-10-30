@@ -19,6 +19,7 @@ import (
 
 	"github.com/p1neappleXpress/OpenFlux/provision"
 	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/avito"
 	"github.com/p1neappleXpress/OpenFlux/transport/cupsonline"
 	"github.com/p1neappleXpress/OpenFlux/transport/yandex"
 	"github.com/p1neappleXpress/OpenFlux/tunnel"
@@ -56,7 +57,14 @@ func failure(err error, extra map[string]interface{}) string {
 // "trust": true, and the app calls again with it once the user agrees. A
 // changed key comes back with "mismatch": true and must not be trusted
 // silently.
-func NodeConnect(host string, port int, user, password, privateKey, passphrase, hostKey string) string {
+//
+// source picks the node's core: "fork" (default) or "official", see
+// provision.PinnedFor.
+func NodeConnect(host string, port int, user, password, privateKey, passphrase, hostKey, source string) string {
+	script, err := provision.PinnedFor(source)
+	if err != nil {
+		return failure(err, nil)
+	}
 	NodeDisconnect()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -72,7 +80,7 @@ func NodeConnect(host string, port int, user, password, privateKey, passphrase, 
 		return failure(err, nil)
 	}
 	appendLog("[NODE] SSH: подключено, загрузка скрипта установки")
-	if err := conn.FetchScript(provision.Pinned()); err != nil {
+	if err := conn.FetchScript(script); err != nil {
 		conn.Close()
 		return failure(err, nil)
 	}
@@ -144,9 +152,9 @@ func nodeTransports(transportsJSON string) ([]provision.ChannelTransport, error)
 }
 
 // NodePlan asks the VDS what installing the channel would change: {"plan"}.
-// transportsJSON: the carriers (see nodeTransports); autoUpdate: the
-// server's core updater.
-func NodePlan(channel string, port int, transportsJSON string, autoUpdate bool) string {
+// transportsJSON: the carriers (see nodeTransports); withCookies: the Yandex
+// sign-in goes to the node too; autoUpdate: the server's core updater.
+func NodePlan(channel string, port int, transportsJSON string, withCookies, autoUpdate bool, mode string) string {
 	conn, err := nodeConn()
 	if err != nil {
 		return failure(err, nil)
@@ -155,7 +163,7 @@ func NodePlan(channel string, port int, transportsJSON string, autoUpdate bool) 
 	if err != nil {
 		return failure(err, nil)
 	}
-	plan, err := conn.Plan(provision.Channel{ID: channel, Port: port, Transports: ts, AutoUpdate: autoUpdate})
+	plan, err := conn.Plan(provision.Channel{ID: channel, Port: port, Transports: ts, AutoUpdate: autoUpdate, Mode: mode}, withCookies)
 	if err != nil {
 		return failure(err, nil)
 	}
@@ -164,7 +172,10 @@ func NodePlan(channel string, port int, transportsJSON string, autoUpdate bool) 
 
 // NodeApply installs and starts the channel. sudoPassword is only used when
 // the account needs one; a wrong one comes back with "sudo": true.
-func NodeApply(channel, transportsJSON, key string, port int, autoUpdate bool, sudoPassword string) string {
+// cookieHeader is the Yandex sign-in for the node ("" for none): the node
+// then opens the Yandex document as that account, which gets it past the
+// checks Yandex shows a server's address.
+func NodeApply(channel, transportsJSON, key string, port int, autoUpdate bool, sudoPassword, cookieHeader, mode string) string {
 	conn, err := nodeConn()
 	if err != nil {
 		return failure(err, nil)
@@ -173,7 +184,12 @@ func NodeApply(channel, transportsJSON, key string, port int, autoUpdate bool, s
 	if err != nil {
 		return failure(err, nil)
 	}
-	ch := provision.Channel{ID: channel, Transports: ts, Key: key, Port: port, AutoUpdate: autoUpdate}
+	ch := provision.Channel{ID: channel, Transports: ts, Key: key, Port: port, AutoUpdate: autoUpdate, Mode: mode}
+	if cookieHeader != "" {
+		if ch.Cookies, err = provision.ChannelCookies(ts, cookieHeader); err != nil {
+			return failure(err, nil)
+		}
+	}
 	appendLog("[NODE] Установка канала " + channel)
 	if err := conn.Apply(ch, sudoPassword); err != nil {
 		appendLog("[NODE] Установка не удалась")
@@ -181,6 +197,126 @@ func NodeApply(channel, transportsJSON, key string, port int, autoUpdate bool, s
 	}
 	appendLog("[NODE] Канал " + channel + " запущен")
 	return result(nil)
+}
+
+// NodeKit renders the installation of a channel as a script the person runs
+// by hand on the machine that will host the node (no SSH from the app): the
+// pinned installer, its SHA-256 check, plan, apply. Nothing connects: the app
+// made the key itself (NodeNewChannel). Returns {ok, kit: {script, paste,
+// context, transports[{type, url, priority, script}], installer}}: script is
+// the file to run as root, paste the same as a block for a terminal, context
+// and transports what the client's profile needs of the channel. source picks
+// the installer like NodeConnect's ("fork", "official").
+func NodeKit(channel, transportsJSON, key string, autoUpdate bool, mode, source string) string {
+	ts, err := nodeTransports(transportsJSON)
+	if err != nil {
+		return failure(err, nil)
+	}
+	installer, err := provision.PinnedFor(source)
+	if err != nil {
+		return failure(err, nil)
+	}
+	kit, err := provision.RenderKitFor(provision.Channel{ID: channel, Transports: ts, Key: key, AutoUpdate: autoUpdate, Mode: mode}, installer)
+	if err != nil {
+		return failure(err, nil)
+	}
+	return result(map[string]interface{}{"kit": kit})
+}
+
+// NodeSetCookies gives an installed channel's node a new Yandex sign-in
+// and restarts it.
+func NodeSetCookies(channel, documentURL, cookieHeader, sudoPassword string) string {
+	conn, err := nodeConn()
+	if err != nil {
+		return failure(err, nil)
+	}
+	cookies, _, err := provision.CookieStore(documentURL, cookieHeader)
+	if err != nil {
+		return failure(err, nil)
+	}
+	if err := conn.SetCookies(channel, cookies, sudoPassword); err != nil {
+		return failure(err, map[string]interface{}{"sudo": errors.Is(err, provision.ErrSudoPassword)})
+	}
+	appendLog("[NODE] Вход в Яндекс передан каналу " + channel)
+	return result(nil)
+}
+
+// NodePushSignIn gives an installed channel's document of the sign-in's
+// service (cookieHeader with Session_id: Yandex, with Mpop: Mail.ru) the
+// owner's sign-in, leaving the channel's other document alone; a node whose
+// core has cookie-inbox takes it without a restart ("merged": true). Answers
+// like NodeShowChannel with the channel as it is now.
+func NodePushSignIn(channel, transportsJSON, cookieHeader, sudoPassword string) string {
+	conn, err := nodeConn()
+	if err != nil {
+		return failure(err, nil)
+	}
+	ts, err := nodeTransports(transportsJSON)
+	if err != nil {
+		return failure(err, nil)
+	}
+	merged, err := conn.PushSignIn(channel, ts, cookieHeader, sudoPassword)
+	if err != nil {
+		return failure(err, map[string]interface{}{"sudo": errors.Is(err, provision.ErrSudoPassword)})
+	}
+	appendLog("[NODE] Вход передан каналу " + channel)
+	info, err := conn.Show(channel, sudoPassword)
+	if err != nil {
+		return failure(err, nil)
+	}
+	return result(map[string]interface{}{"channel": info, "merged": merged})
+}
+
+// NodeShowChannel reads an installed channel: its documents, port, state
+// and encryption context, as {"ok":true,"channel":{...}} (see
+// provision.ChannelInfo). The key stays on the server.
+func NodeShowChannel(channel, sudoPassword string) string {
+	conn, err := nodeConn()
+	if err != nil {
+		return failure(err, nil)
+	}
+	info, err := conn.Show(channel, sudoPassword)
+	if err != nil {
+		return failure(err, map[string]interface{}{"sudo": errors.Is(err, provision.ErrSudoPassword)})
+	}
+	return result(map[string]interface{}{"channel": info})
+}
+
+// NodeSetTransports changes the documents of an installed, running channel
+// (transportsJSON as for NodePlan; direct stays). Its key, port and
+// encryption context stay, so its links keep working. cookieHeader, when
+// not empty, is a new Yandex sign-in for the channel's Yandex document.
+// Answers like NodeShowChannel with the channel as it is now.
+func NodeSetTransports(channel, transportsJSON, cookieHeader, sudoPassword, mode string) string {
+	conn, err := nodeConn()
+	if err != nil {
+		return failure(err, nil)
+	}
+	ts, err := nodeTransports(transportsJSON)
+	if err != nil {
+		return failure(err, nil)
+	}
+	var cookies string
+	if cookieHeader != "" {
+		if cookies, err = provision.ChannelCookies(ts, cookieHeader); err != nil {
+			return failure(err, nil)
+		}
+	}
+	if err := conn.SetChannel(channel, ts, mode, cookies, sudoPassword); err != nil {
+		return failure(err, map[string]interface{}{"sudo": errors.Is(err, provision.ErrSudoPassword)})
+	}
+	appendLog("[NODE] Транспорты канала " + channel + " изменены")
+	info, err := conn.Show(channel, sudoPassword)
+	if err != nil {
+		return failure(err, nil)
+	}
+	return result(map[string]interface{}{"channel": info})
+}
+
+// NodeSignedIn reports whether a WebView Cookie header holds a Yandex login.
+func NodeSignedIn(cookieHeader string) bool {
+	_, signedIn, err := provision.CookieStore("x", cookieHeader)
+	return err == nil && signedIn
 }
 
 // NodeRemove deletes the channel from the VDS (a failed verification's
@@ -195,6 +331,21 @@ func NodeRemove(channel, sudoPassword string) string {
 	}
 	appendLog("[NODE] Канал " + channel + " удалён с сервера")
 	return result(nil)
+}
+
+// NodeUpgrade moves every channel on the VDS to the core this build pins and
+// restarts the running ones: {"core", "restarted": [channel...]}.
+func NodeUpgrade(sudoPassword string) string {
+	conn, err := nodeConn()
+	if err != nil {
+		return failure(err, nil)
+	}
+	res, err := conn.Upgrade(sudoPassword)
+	if err != nil {
+		return failure(err, map[string]interface{}{"sudo": errors.Is(err, provision.ErrSudoPassword)})
+	}
+	appendLog("[NODE] Каналы на сервере переведены на ядро " + res.Core)
+	return result(map[string]interface{}{"core": res.Core, "restarted": res.Restarted})
 }
 
 // NodeCheckDocument tells whether the vyandex transport can use the
@@ -223,7 +374,7 @@ func NodeCheckDocument(documentURL string) string {
 // for specsJSON (as Profile.sessionTransportsJson builds it) and fetches
 // https://api.ipify.org through the tunnel, expecting the VDS's address
 // (expectHost, resolved here). The node's own Yandex check shows up in
-// PendingCaptchaURL like on a regular connect. Returns {"ip"}. Only one
+// PendingPromptURL like on a regular connect. Returns {"ip"}. Only one
 // connection can run at a time, so the app stops its tunnel first.
 func NodeVerify(specsJSON, secret, expectHost string, timeoutSec int) string {
 	if ProxyIsRunning() || ExitIsRunning() || packetRunning() {
@@ -255,10 +406,10 @@ func NodeVerify(specsJSON, secret, expectHost string, timeoutSec int) string {
 	if err != nil {
 		return failure(err, nil)
 	}
-	// Same order as StopProxy: the captcha side first, then the carriers.
+	// Same order as StopProxy: the prompt side first, then the carriers.
 	defer func() {
-		detachCaptcha()
-		CancelCaptcha()
+		detachPrompt()
+		CancelPrompt()
 		setAuthProxy(nil)
 		clearRoute()
 		_ = trans.Stop()
@@ -284,7 +435,7 @@ func NodeVerify(specsJSON, secret, expectHost string, timeoutSec int) string {
 	// Traffic may have gone through the backup carrier. Give the primary
 	// (highest priority) one the rest of the time to come up: the node may
 	// first need its own Yandex check passed, which reaches the app over the
-	// backup carrier as a pending captcha.
+	// backup carrier as a pending prompt.
 	names := sess.Transports()
 	primary := len(names) > 0 && waitLive(ctx, sess, names[0])
 	return result(map[string]interface{}{"ip": ip, "primary": primary, "live": sess.LiveTransports()})
@@ -370,6 +521,19 @@ func NodeCreateCupsRooms() string {
 	return result(map[string]interface{}{"rooms": rooms})
 }
 
+// NodeCreateAvitoRooms creates Avito Code rooms for a new channel's config:
+// {"rooms"}, the packed list (no sign-in needed), like NodeCreateCupsRooms.
+func NodeCreateAvitoRooms() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	rooms, err := avito.CreateRoomList(ctx, "")
+	if err != nil {
+		return failure(fmt.Errorf("не удалось создать комнаты Avito: %v", err), nil)
+	}
+	appendLog("[NODE] Созданы комнаты Avito для канала")
+	return result(map[string]interface{}{"rooms": rooms})
+}
+
 // NodeShareLink returns the openflux:// link of a new channel: the Session
 // profile a client needs (its carriers from transportsJSON, see
 // nodeTransports, and direct to host:port as the backup). The app saves it
@@ -381,4 +545,15 @@ func NodeShareLink(name, transportsJSON, key, host string, port int) (string, er
 		return "", err
 	}
 	return provision.ShareLink(name, key, host, port, ts)
+}
+
+// NodeShareLinkContext is NodeShareLink for an installed channel whose
+// encryption context is set (NodeShowChannel's "context"): the link keeps it
+// whatever the channel's first document is now.
+func NodeShareLinkContext(name, transportsJSON, key, host string, port int, context string) (string, error) {
+	ts, err := nodeTransports(transportsJSON)
+	if err != nil {
+		return "", err
+	}
+	return provision.ShareLinkContext(name, key, host, port, ts, context)
 }

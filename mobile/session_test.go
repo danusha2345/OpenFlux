@@ -78,13 +78,13 @@ func contextOf(t *testing.T, specs []sessionSpec) string {
 	return ctx
 }
 
-func TestSessionContextPrefersHighestPriorityURL(t *testing.T) {
+func TestSessionContextIsPinned(t *testing.T) {
 	specs := []sessionSpec{
 		{Name: "mailru", Type: "mailru", URL: "https://cloud.example/m", Priority: 10},
 		{Name: "direct", Type: "direct", Priority: 100},
 		{Name: "yandex", Type: "yandex", URL: "https://docs.example/d", Priority: 50},
 	}
-	if got := contextOf(t, specs); got != "https://docs.example/d" {
+	if got := contextOf(t, specs); got != "http://#" {
 		t.Fatalf("context = %q", got)
 	}
 	if got := contextOf(t, []sessionSpec{{Name: "direct", Type: "direct"}}); got != "http://#" {
@@ -99,7 +99,7 @@ func TestSessionContextSkipsCupsonline(t *testing.T) {
 		{Name: "cupsonline", Type: "cupsonline", URL: "room-list", Priority: 100},
 		{Name: "yandex", Type: "yandex", URL: "https://docs.example/d", Priority: 50},
 	}
-	if got := contextOf(t, specs); got != "https://docs.example/d" {
+	if got := contextOf(t, specs); got != "http://#" {
 		t.Fatalf("context = %q", got)
 	}
 	if got := contextOf(t, specs[:1]); got != "http://#" {
@@ -127,10 +127,21 @@ func TestSessionContextFromLink(t *testing.T) {
 
 // A classic exit's link names the context the classic client derives.
 func TestClassicShareContext(t *testing.T) {
-	if c := exitShareClassic("mailru", "https://cloud.example/m", "0123456789abcdef", "batched"); c.Context != "https://cloud.example/m" {
+	if c := exitShareClassic("mailru", "https://cloud.example/m", "0123456789abcdef", "batched"); c.Context != "http://#" {
 		t.Fatalf("mailru context = %q", c.Context)
 	}
 	if c := exitShareClassic("cupsonline", "room-list", "0123456789abcdef", "batched"); c.Context != "http://#" {
 		t.Fatalf("cupsonline context = %q", c.Context)
+	}
+}
+
+func TestSessionSpecsNetwork(t *testing.T) {
+	js := `{"bonding":true,"transports":[{"type":"mailru","url":"https://cloud.mail.ru/public/a/b","network":"cellular"},{"type":"direct","params":{"dial":"1.2.3.4:5"},"network":"wifi"}]}`
+	specs, _, _, err := parseSessionSpecs(js)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if specs[0].Network != "cellular" || specs[1].Network != "wifi" {
+		t.Fatalf("networks %q %q", specs[0].Network, specs[1].Network)
 	}
 }

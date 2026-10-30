@@ -1,6 +1,6 @@
 module github.com/p1neappleXpress/OpenFlux
 
-go 1.26.6
+go 1.26.10
 
 require github.com/gorilla/websocket v1.5.3
 
@@ -27,8 +27,8 @@ require (
 	github.com/pion/webrtc/v4 v4.2.22
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/xjasonlyu/windivert-go v0.0.0-20201010013527-4239d0afa76f
-	golang.org/x/crypto v0.56.0
-	golang.org/x/net v0.57.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.60.0
 	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 )
 
@@ -42,12 +42,15 @@ require (
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/mdns/v2 v2.2.1 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
-	github.com/pion/sctp v1.11.3 // indirect
+	github.com/pion/sctp v1.11.3
 	github.com/pion/srtp/v3 v3.1.0 // indirect
 	github.com/pion/stun/v4 v4.0.1 // indirect
-	github.com/pion/transport/v5 v5.1.1 // indirect
+	github.com/pion/transport/v5 v5.1.1
 	github.com/pion/turn/v5 v5.1.2 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 )
+
+// A one-change copy of pion/sctp (third_party/sctp/OPENFLUX_PATCH.md): the MTU of a data channel's packets can be set.
+replace github.com/pion/sctp => ./third_party/sctp

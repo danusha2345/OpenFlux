@@ -55,7 +55,7 @@ func TestNodeWizardProtocolLines(t *testing.T) {
 
 func TestNodeWizardNeedsConnection(t *testing.T) {
 	w := newNodeWizard()
-	for _, m := range []string{"plan", "apply", "remove"} {
+	for _, m := range []string{"plan", "apply", "setCookies", "pushSignIn", "remove", "showChannel", "setTransports"} {
 		r := wizardCall(t, w, m, map[string]string{"channel": "c1"})
 		if r["ok"] != false || r["error"] != "нет подключения к серверу" {
 			t.Fatalf("%s: %v", m, r)
@@ -130,12 +130,18 @@ func TestNodeWizardShareLinkAndSignIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !c.Negotiate || c.Secret != key || c.Context != doc || len(c.Transports) != 2 ||
+	if !c.Negotiate || c.Secret != key || c.Context != "http://#" || len(c.Transports) != 2 ||
 		c.Transports[0].Type != "vyandex" || c.Transports[1].Dial != "203.0.113.5:8445" {
 		t.Fatalf("link config: %+v", c)
 	}
 	if r := wizardCall(t, w, "shareLink", wizardParams{DocumentURL: doc, Key: key}); r["ok"] != false {
 		t.Fatalf("no host: %v", r)
+	}
+	if r := wizardCall(t, w, "signedIn", wizardParams{Cookies: "yandexuid=1; Session_id=s"}); r["signedIn"] != true {
+		t.Fatalf("signed in: %v", r)
+	}
+	if r := wizardCall(t, w, "signedIn", wizardParams{Cookies: "yandexuid=1"}); r["signedIn"] != false {
+		t.Fatalf("anonymous: %v", r)
 	}
 }
 
@@ -152,7 +158,7 @@ func TestNodeWizardShareLinkWithChosenTransports(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Context != mailru || len(c.Transports) != 3 || c.Transports[0].Type != "mailru" ||
+	if c.Context != "http://#" || len(c.Transports) != 3 || c.Transports[0].Type != "mailru" ||
 		c.Transports[1].Type != "cupsonline" || c.Transports[2].Dial != "203.0.113.5:8445" {
 		t.Fatalf("link config: %+v", c)
 	}
@@ -160,6 +166,27 @@ func TestNodeWizardShareLinkWithChosenTransports(t *testing.T) {
 		Transports: []provision.ChannelTransport{{Type: "boards", URL: "https://boards.yandex.ru/x"}}})
 	if r["ok"] != false {
 		t.Fatalf("a transport the wizard does not offer: %v", r)
+	}
+}
+
+// A link for an installed channel whose documents changed keeps the
+// channel's context, not the one its new first document would give.
+func TestNodeWizardShareLinkKeepsChannelContext(t *testing.T) {
+	w := newNodeWizard()
+	key := strings.Repeat("ab", 32)
+	mailru := "https://cloud.mail.ru/public/DEmN/ETbZW2MPY"
+	doc := "https://docs.yandex.ru/edit/d/S3sjFjA-ZmVWgXQPTmVwdSPegnqahzm72s0qoIz-cKg6OTJnZ2wza1d2UQ"
+	r := wizardCall(t, w, "shareLink", wizardParams{Name: "Нода", Key: key, Host: "203.0.113.5", ChannelPort: 8445,
+		Transports: []provision.ChannelTransport{{Type: "mailru", URL: mailru}}, Context: doc})
+	if r["ok"] != true {
+		t.Fatalf("shareLink: %v", r)
+	}
+	c, err := share.Decode(r["link"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Context != doc || c.Transports[0].URL != mailru {
+		t.Fatalf("link config: %+v", c)
 	}
 }
 
@@ -243,5 +270,42 @@ func TestNodeConfMatchesShareLink(t *testing.T) {
 				t.Fatalf("%+v: carrier %d: node %+v, link %+v", ts, i, s, lt)
 			}
 		}
+	}
+}
+
+func TestNodeWizardRefusesUnknownSource(t *testing.T) {
+	w := newNodeWizard()
+	dialled := false
+	w.dial = func(context.Context, provision.Target) (*provision.Conn, error) {
+		dialled = true
+		return nil, errors.New("dialled")
+	}
+	r := wizardCall(t, w, "connect", wizardParams{Host: "h", User: "u", Password: "p", Source: "elsewhere"})
+	if r["ok"] != false || !strings.Contains(r["error"].(string), "источник") || dialled {
+		t.Fatalf("connect with an unknown source: %v (dialled %v)", r, dialled)
+	}
+}
+
+// The helper's kit renders without a connection, with the chosen installer, and shows what the client needs of the channel.
+func TestNodeWizardKit(t *testing.T) {
+	w := newNodeWizard()
+	w.newScript = func(source string) (provision.Script, error) { return provision.PinnedFor(source) }
+	key := strings.Repeat("ab", 32)
+	out := wizardCall(t, w, "kit", map[string]interface{}{
+		"channel": "of-kit", "key": key, "autoUpdate": true, "mode": "l3", "source": "official",
+		"transports": []map[string]interface{}{{"type": "mailru", "url": "https://cloud.mail.ru/public/DEmN/ETbZW2MPY"}},
+	})
+	if out["ok"] != true {
+		t.Fatalf("kit: %v", out)
+	}
+	kit := out["kit"].(*provision.Kit)
+	if !strings.Contains(kit.Script, "mode=l3") || !strings.Contains(kit.Script, provision.OfficialSHA256) || !strings.Contains(kit.Script, key) {
+		t.Errorf("kit script = %.400s", kit.Script)
+	}
+	if bad := wizardCall(t, w, "kit", map[string]interface{}{"channel": "of-kit", "key": "short"}); bad["ok"] != false {
+		t.Errorf("a short key made a kit: %v", bad)
+	}
+	if bad := wizardCall(t, w, "kit", map[string]interface{}{"channel": "of-kit", "key": key, "source": "nonsense"}); bad["ok"] != false {
+		t.Errorf("an unknown source made a kit: %v", bad)
 	}
 }

@@ -2,6 +2,7 @@ package mobile
 
 import (
 	"fmt"
+	"github.com/p1neappleXpress/OpenFlux/netguard"
 	"io"
 	"net"
 	"net/http"
@@ -17,6 +18,8 @@ import (
 // The phone as an l4 exit: a CLI-style Session client reaches it over
 // direct and its HTTP request leaves through the phone.
 func TestExitServesSessionClient(t *testing.T) {
+	netguard.SetAllowPrivate(true)
+	t.Cleanup(func() { netguard.SetAllowPrivate(false) })
 	web := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "via phone exit")
 	}))

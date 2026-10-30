@@ -19,6 +19,9 @@ type sessionSpec struct {
 	URL      string                 `json:"url"`
 	Priority int                    `json:"priority"`
 	Params   map[string]interface{} `json:"params"`
+	// Network binds the carrier to one network ("cellular", "wifi"; ""
+	// is the default route) through the app's NetworkBinder.
+	Network string `json:"network"`
 }
 
 // sessionOptions tunes buildSessionWith beyond the specs.
@@ -132,6 +135,8 @@ func buildSessionWith(specsJSON, secret string, exit bool, opt sessionOptions) (
 	types := make(map[string]string)
 	for _, spec := range specs {
 		types[spec.Name] = spec.Type
+		config := config
+		config.Network = spec.Network
 		raw, err := newRawTransport(spec.Type, spec.URL, spec.Params, config, exit)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%s: %w", spec.Name, err)
@@ -174,7 +179,7 @@ func buildSessionWith(specsJSON, secret string, exit bool, opt sessionOptions) (
 	if exit {
 		// The exit relays its own checks to the client itself (AuthRequired);
 		// the phone's UI can still pass them locally.
-		attachSessionCaptcha(m, keys, nil)
+		attachSessionPrompt(m, keys, nil)
 		appendLog("[ANDROID] Session: шифрование AES-256-GCM, ожидание клиента")
 		return m, sess, nil
 	}
@@ -184,7 +189,8 @@ func buildSessionWith(specsJSON, secret string, exit bool, opt sessionOptions) (
 	demux := transport.NewPortDemux(m, authProxyPortLo, authProxyPortHi)
 	proxy := &authProxy{demux: demux}
 	setAuthProxy(proxy)
-	attachSessionCaptcha(m, keys, proxy)
+	attachSessionPrompt(m, keys, proxy)
+	setClientSession(m, types)
 	appendLog("[ANDROID] Session: шифрование AES-256-GCM, согласование с нодой")
 	return demux, sess, nil
 }

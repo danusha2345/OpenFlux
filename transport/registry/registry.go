@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/p1neappleXpress/OpenFlux/transport"
 	"github.com/p1neappleXpress/OpenFlux/transport/avito"
@@ -56,6 +57,12 @@ var Types = []string{"yandex", "vyandex", "boards", "mailru", "cupsonline", "avi
 // (and "is_exit") for direct, "path"/"pubkey"/"name" plus whatever the script
 // itself asked for for script. An empty type is yandex.
 func New(typ, url string, params map[string]interface{}, o Options) (transport.Transport, error) {
+	if links := typedLinks(url); links != nil {
+		return newMixed(links, params, o)
+	}
+	if urls := groupURLs(url, params); urls != nil {
+		return newGroup(typ, urls, params, o)
+	}
 	base := o.Base
 	if o.LowMemory {
 		base.MaxQueueSize = 512
@@ -87,9 +94,9 @@ func New(typ, url string, params map[string]interface{}, o Options) (transport.T
 	case "cupsonline":
 		// Stripes over its rooms itself when the room list says so (see
 		// transport.PackRooms); an old list keeps the old wire.
-		return cupsonline.NewCupsonlineTransport(url, base, !o.IsExit), nil
+		return cupsonline.NewCupsonlineTransport(url, base, !roleParam(params, "exit", o.IsExit)), nil
 	case "avito":
-		return avito.NewAvitoTransport(url, base, o.AvitoCookies, !o.IsExit), nil
+		return avito.NewAvitoTransport(url, base, o.AvitoCookies, !roleParam(params, "exit", o.IsExit)), nil
 	case "oneme":
 		uid, _ := strconv.ParseInt(str("uid"), 10, 64)
 		return oneme.NewOneMeTransport(roleParam(params, "exit", o.IsExit), str("token"), uid, base), nil
@@ -99,6 +106,9 @@ func New(typ, url string, params map[string]interface{}, o Options) (transport.T
 		return newScript(url, params, o)
 	case "direct":
 		return newDirect(params, o)
+	case "mixed":
+		// A mixed group is recognised by its url ("type:link ..."), above.
+		return nil, errors.New("mixed: в url нужны ссылки вида тип:ссылка (cupsonline:... avito:... mailru:...)")
 	}
 	return nil, fmt.Errorf("unknown transport type %q", typ) // the apps never offer an unknown one
 }
@@ -145,7 +155,9 @@ func newTelemost(url string, params map[string]interface{}, o Options) transport
 		maxLanes = n
 	}
 	g := yandex.NewTelemostGroup(str("cookies"), url, n, o.IsExit, o.Base)
-	return transport.NewStripedTransportAuto(g.Lanes(), g, maxLanes, auto)
+	stripe := transport.NewStripedTransportAuto(g.Lanes(), g, maxLanes, auto)
+	stripe.SetHealthDeadline(60 * time.Second)
+	return stripe
 }
 
 // A Telemost carrier starts with telemostLanes lanes and adds one whenever
@@ -180,6 +192,7 @@ func newDirect(params map[string]interface{}, o Options) (transport.Transport, e
 		listen = dial // a profile keeps one address per transport
 	}
 	dcfg.DialAddr, dcfg.ListenAddr = dial, listen
+	dcfg.Unpreferred = !preferParam(params)
 	if o.StrictDirect {
 		if dcfg.IsExit && listen == "" {
 			return nil, errors.New("direct: не указан адрес для прослушивания (host:port)")
@@ -260,4 +273,24 @@ func withRole(params map[string]interface{}, isExit bool) map[string]interface{}
 		out["exit"] = isExit
 	}
 	return out
+}
+
+// preferParam reads a direct transport's "prefer" parameter: true unless the
+// profile says no. A profile may carry it as a bool, a number or a string
+// (true/false, yes/no, on/off, 1/0).
+func preferParam(params map[string]interface{}) bool {
+	switch v := params["prefer"].(type) {
+	case bool:
+		return v
+	case float64:
+		return v != 0
+	case int:
+		return v != 0
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "no", "off", "false", "0":
+			return false
+		}
+	}
+	return true
 }

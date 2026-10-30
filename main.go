@@ -246,6 +246,12 @@ func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--node-wizard" {
 		os.Exit(runNodeWizard(os.Stdin, os.Stdout))
 	}
+	// What this core can do, one word a line, for node-install.sh to ask
+	// before it relies on it (an older core fails on the unknown flag).
+	if len(os.Args) == 2 && os.Args[1] == "--features" {
+		fmt.Print(coreFeatures)
+		return
+	}
 	// The core's own openflux:// parser and builder for apps and scripts,
 	// so a link is read and made the same way everywhere: JSON on stdout,
 	// before any banner.
@@ -281,6 +287,7 @@ func main() {
 	role := flag.String("role", roleClient, "client | exit | bench-send | bench-sink")
 	inbound := flag.String("inbound", "", "tun | socks5 (client only; default: tun on macOS, socks5 elsewhere)")
 	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, oneme, cupsonline, mailru, telemost)")
+	lanesFlag := flag.Int("lanes", 0, "Exit with no --url: run N carriers of this transport as lanes of one stripe, each creating its own rooms (cupsonline, avito); with --url, a comma-separated list of links is striped the same way")
 	mode := flag.String("mode", "", "Exit-node mode: l3 (default; Linux as root, or Windows as Administrator with WinDivert) or l4 (works everywhere)")
 
 	codec := flag.String("codec", codecBatched, "batched (default, zstd+coalescing) or legacy (per-packet LZ4)")
@@ -299,6 +306,7 @@ func main() {
 			"from --config), falling back to --transport. Only set this to override that derivation.")
 
 	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
+	urlFile := flag.String("url-file", "", "Read --url from this file, so the document URL stays out of the process list and shell history")
 	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
 	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
 	directDial := flag.String("direct-dial", "", "DirectTransport: exit address to dial (client). Requires --encryption-key-file")
@@ -319,6 +327,7 @@ func main() {
 	scriptPath := flag.String("script-path", "", "Path to the script transport's <name>.flux or <name>.js (needs <name>.js.sig beside a bare .js)")
 	scriptPubkey := flag.String("script-pubkey", "", "Hex-encoded ed25519 public key the script transport's signature is checked against")
 	scriptName := flag.String("script-name", "", "Carrier name for the script transport (default: the name in its own info())")
+	refusePeerLogin := flag.Bool("refuse-peer-login", false, "Exit: take no account sign-in (Yandex, Mail.ru login cookies) from clients over the Session; only the owner's push over SSH (node-install.sh set-cookies) changes it")
 	scriptAutoUpdate := flag.Bool("script-auto-update", false, "Node: keep .flux transports current and self-heal (check/apply auto-OK updates, roll back, hot-swap without a restart)")
 	scriptUpdateChannel := flag.String("script-update-channel", "stable", "Node: update channel for --script-auto-update (stable | nightly)")
 	configPath := flag.String("config", "",
@@ -332,6 +341,7 @@ func main() {
 			"Empty = no IPC server.")
 	allowPrivate := flag.Bool("allow-private", false, "Exit: allow private/link-local destinations")
 	socksAddr := flag.String("socks5", "127.0.0.1:1080", "SOCKS5 address")
+	upstreamProxy := flag.String("upstream-proxy", "", "Exit (l4): open TCP connections through this SOCKS5 proxy, e.g. 127.0.0.1:10808 or socks5://user:pass@host:port")
 	httpProxyAddr := flag.String("http-proxy", "", "Client: also serve an HTTP proxy (CONNECT and plain requests) on this address, through the same tunnel")
 	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (l3 mode only, scoped RST drop)")
 
@@ -547,6 +557,16 @@ DEPRECATED (removed in v2)
 				*debug = 1
 			}
 		}
+		if v, ok := confValue(conf.Interface, "Bonding"); ok && confBool(v, false) {
+			log.Printf("Bonding = %s: bonding is no longer supported, the carriers fail over by priority", v)
+		}
+		// A node channel with .flux carriers keeps them current (node-install.sh writes it).
+		if v, ok := confValue(conf.Interface, "ScriptAutoUpdate"); ok && !setFlags["script-auto-update"] {
+			*scriptAutoUpdate = confBool(v, false)
+		}
+		if v, ok := confValue(conf.Interface, "RefusePeerLogin"); ok && !setFlags["refuse-peer-login"] {
+			*refusePeerLogin = confBool(v, false)
+		}
 		if v, ok := confValue(conf.Interface, "Sensitive"); ok && !setFlags["sensitive"] && !setFlags["sensetive"] {
 			*sensitive = confBool(v, *sensitive)
 		}
@@ -569,6 +589,9 @@ DEPRECATED (removed in v2)
 					"dial":    t.Values["Dial"],
 					"listen":  t.Values["Listen"],
 					"is_exit": isExit,
+				}
+				if v := t.Values["Prefer"]; v != "" {
+					spec.Params["prefer"] = confBool(v, true)
 				}
 			}
 			if spec.Type == "oneme" {
@@ -593,6 +616,24 @@ DEPRECATED (removed in v2)
 					}
 					spec.Params["settings"] = settings
 				}
+			}
+			if n := t.Values["Network"]; n != "" {
+				if !validNetwork(n) {
+					log.Fatalf("--config: [Transport %s] Network = %q: cellular, wifi or ethernet", t.Name, n)
+				}
+				if spec.Params == nil {
+					spec.Params = map[string]interface{}{}
+				}
+				spec.Params["network"] = n
+			}
+			if spec.Type == "cupsonline" {
+				spec.Params = map[string]interface{}{"exit": isExit}
+			}
+			if n := confInt(t.Values["Lanes"], 0); n >= 2 {
+				if spec.Params == nil {
+					spec.Params = map[string]interface{}{}
+				}
+				spec.Params["lanes"] = n
 			}
 			confTransports = append(confTransports, spec)
 		}
@@ -639,6 +680,17 @@ DEPRECATED (removed in v2)
 	}
 
 	// Platform defaults. The recommended client path is utun on macOS and
+	if *urlFile != "" {
+		if globalDocUrl != "http://#" {
+			log.Fatal("--url-file and --url are exclusive")
+		}
+		u, err := readURLFile(*urlFile)
+		if err != nil {
+			log.Fatalf("--url-file: %v", err)
+		}
+		globalDocUrl = u
+	}
+
 	// SOCKS5 everywhere else (see README for details). Stream mode keeps
 	// SOCKS5 unless the full tunnel is asked for by name: it was a proxy
 	// first, and the apps' proxy profiles do not pass --inbound.
@@ -652,6 +704,25 @@ DEPRECATED (removed in v2)
 	}
 	if *mode == "" {
 		*mode = "l3"
+		// Only the l4 exit dials its own connections, so only it can use
+		// an upstream proxy.
+		if *role == roleExit && *upstreamProxy != "" {
+			*mode = "l4"
+		}
+	}
+	if *upstreamProxy != "" {
+		if *role != roleExit {
+			log.Fatal("--upstream-proxy applies to --role=exit only")
+		}
+		if *mode != "l4" {
+			log.Fatal("--upstream-proxy needs --mode=l4: an l3 exit forwards packets and dials nothing itself")
+		}
+		if err := tunnel.SetExitUpstream(*upstreamProxy); err != nil {
+			log.Fatalf("--upstream-proxy: %v", err)
+		}
+		if addr := tunnel.ExitUpstream(); addr != "" {
+			log.Printf("Exit TCP goes through SOCKS5 %s", addr)
+		}
 	}
 
 	if *codec != codecBatched && *codec != codecLegacy {
@@ -812,7 +883,8 @@ DEPRECATED (removed in v2)
 			urls["yandex"] = globalDocUrl
 		}
 		extra := map[string]map[string]interface{}{
-			"oneme": {"token": *onemeToken, "uid": *onemeUID, "exit": isExit},
+			"oneme":      {"token": *onemeToken, "uid": *onemeUID, "exit": isExit},
+			"cupsonline": {"exit": isExit},
 			"direct": {
 				"dial":    *directDial,
 				"listen":  *directListen,
@@ -844,6 +916,15 @@ DEPRECATED (removed in v2)
 			specs[0].Params = map[string]interface{}{
 				"path": *scriptPath, "pubkey": *scriptPubkey, "name": *scriptName,
 			}
+		}
+		if *transportType == "cupsonline" {
+			specs[0].Params = map[string]interface{}{"exit": isExit}
+		}
+		if *lanesFlag >= 2 {
+			if specs[0].Params == nil {
+				specs[0].Params = map[string]interface{}{}
+			}
+			specs[0].Params["lanes"] = *lanesFlag
 		}
 	}
 
@@ -908,19 +989,9 @@ DEPRECATED (removed in v2)
 	// sections in a .conf describe one just like --transports.
 	//
 	// A classic setup (--transport=X) with a key runs as a Session too,
-	// with classic compatibility: a client falls back to the classic
-	// layering while the exit does not answer the handshake and upgrades
-	// once it does; an exit serves classic clients and Session clients.
-	// Only --negotiate is strict. Without a key only classic is possible.
+	// with classic compatibility (see classicCompatible).
 	configuredSession := *negotiate || *transportsFlag != "" || len(confTransports) > 0
-	classicCompat := false
-	switch {
-	case *role != roleClient && *role != roleExit:
-	case !configuredSession && secret != "":
-		classicCompat = true
-	case configuredSession && !*negotiate && *role == roleClient && len(specs) == 1:
-		classicCompat = true
-	}
+	classicCompat := classicCompatible(*role, configuredSession, *negotiate, secret != "", len(specs))
 	if configuredSession || classicCompat {
 		if secret == "" {
 			log.Fatal("--transports/--negotiate/.conf transports require --encryption-key-file")
@@ -978,6 +1049,13 @@ DEPRECATED (removed in v2)
 					utils.Debugf("[COOKIE] replay %s: %v", spec.Name, err)
 				}
 			}
+			// The exit keeps its owner's sign-ins fresh: pushes over SSH
+			// (the inbox, SIGHUP), what the services refresh, and a state
+			// file the owner's app reads (signin_node.go).
+			if isExit {
+				managerInst.SetRefusePeerLogin(*refusePeerLogin)
+				startExitSignInKeeper(managerInst, store)
+			}
 		}
 
 		// Hook the Session control dispatcher into the manager.
@@ -998,7 +1076,7 @@ DEPRECATED (removed in v2)
 
 			// Checks for local transports go to the app as-is; checks the
 			// exit reports are marked Remote, to be passed from its address.
-			managerInst.SetCaptchaNotifier(func(name, url, html, reason string) {
+			managerInst.SetPromptNotifier(func(name, url, html, reason string) {
 				_ = srv.SendCookiesRequest(localCheckRequest(name, url, html, reason))
 			})
 			if *role == roleClient {
@@ -1029,12 +1107,12 @@ DEPRECATED (removed in v2)
 		// Session needs one), or a bench role.
 		// The types the classic path serves; the registry builds them.
 		switch *transportType {
-		case "boards", "vyandex", "yandex", "oneme", "cupsonline", "avito", "mailru", "telemost":
+		case "boards", "vyandex", "yandex", "oneme", "cupsonline", "avito", "mailru", "telemost", "mixed":
 		default:
 			log.Fatalf("Unknown transport type: %s", *transportType)
 		}
 		inner, err := registry.New(*transportType, globalDocUrl,
-			map[string]interface{}{"token": maxToken, "uid": maxUid, "exit": isExit},
+			classicParams(maxToken, maxUid, isExit, *lanesFlag),
 			registry.Options{Base: config, IsExit: isExit, YandexCookiesFile: yandexCookiesFile, AvitoCookies: avitoCookiesStr})
 		if err != nil {
 			log.Fatalf("%s: %v", *transportType, err)
@@ -1281,9 +1359,9 @@ func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {
 // streamCarrier builds the carrier the stream mux rides.
 func streamCarrier(transportType, url string) phpbox.Carrier {
 	switch transportType {
-	case "cupsonline", "yandex", "", "vyandex", "mailru":
+	case "cupsonline", "avito", "yandex", "", "vyandex", "mailru":
 	default:
-		log.Fatalf("--mode=stream: transport %q not supported (use cupsonline, yandex, vyandex, mailru)", transportType)
+		log.Fatalf("--mode=stream: transport %q not supported (use cupsonline, avito, yandex, vyandex, mailru)", transportType)
 	}
 	t, err := registry.New(transportType, url, nil, registry.Options{
 		Base: transport.DefaultConfig(), YandexCookiesFile: yandexCookiesFile, AvitoCookies: avitoCookiesStr,
@@ -1366,6 +1444,9 @@ func runClient(trans transport.Transport, inbound, socksAddr, httpProxyAddr stri
 		// for platforms without a tun client (see README).
 		log.Printf("Running as CLIENT (SOCKS5 on %s, legacy gVisor path)", socksAddr)
 		tun := tunnel.NewTCPTunnelMode(trans, false, exitMode)
+		if err := tun.Err(); err != nil {
+			log.Fatal(err)
+		}
 		if httpProxyAddr != "" {
 			ln, err := net.Listen("tcp", httpProxyAddr)
 			if err != nil {
@@ -1451,4 +1532,13 @@ func hasTelemost(specs []transportSpec) bool {
 		}
 	}
 	return false
+}
+
+// classicParams are the registry params of the single-transport path.
+func classicParams(token string, uid string, isExit bool, lanes int) map[string]interface{} {
+	p := map[string]interface{}{"token": token, "uid": uid, "exit": isExit}
+	if lanes >= 2 {
+		p["lanes"] = lanes
+	}
+	return p
 }

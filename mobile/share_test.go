@@ -25,7 +25,15 @@ func TestExitShareLinkConnectsAClient(t *testing.T) {
 	if _, err := ExitShareLink("127.0.0.1", "x"); err == nil {
 		t.Fatal("a link was produced while the exit is not running")
 	}
-	if msg := StartSessionExit(exitSpecs, testSecret); msg != "" {
+	if tmpl := exitShareSession(exitSpecs, testSecret); tmpl == nil || len(tmpl.Transports) != 2 {
+		t.Fatal("MAX must be excluded from the share template")
+	}
+	// Exercise the session offline; unavailable optional carriers are tested separately.
+	var offline []map[string]interface{}
+	_ = json.Unmarshal([]byte(exitSpecs), &offline)
+	offline = offline[:1]
+	offlineJSON, _ := json.Marshal(offline)
+	if msg := StartSessionExit(string(offlineJSON), testSecret); msg != "" {
 		t.Fatal(msg)
 	}
 	defer StopExit()
@@ -42,8 +50,8 @@ func TestExitShareLinkConnectsAClient(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &c); err != nil {
 		t.Fatal(err)
 	}
-	if c.Name != "Pixel" || !c.Negotiate || c.Context != doc || c.Secret != testSecret || len(c.Transports) != 2 ||
-		c.Transports[0].Dial != "127.0.0.1:"+port || c.Transports[1].URL != doc {
+	if c.Name != "Pixel" || !c.Negotiate || c.Context != "http://#" || c.Secret != testSecret || len(c.Transports) != 1 ||
+		c.Transports[0].Dial != "127.0.0.1:"+port {
 		t.Fatalf("link carries %+v (MAX must be left out)", c)
 	}
 

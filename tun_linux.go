@@ -12,6 +12,7 @@ import (
 
 	"github.com/p1neappleXpress/OpenFlux/netbind"
 	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/tunnel"
 	"github.com/p1neappleXpress/OpenFlux/utils"
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -139,6 +140,7 @@ func (c *TUNClient) ConfigureDefault() error {
 func (c *TUNClient) Start() {
 	c.trans.Receive(func(pkt []byte) {
 		if !c.closed.Load() {
+			tunnel.ClampDeviceSyn(c.trans, pkt)
 			if _, err := c.dev.Write([][]byte{pkt}, 0); err != nil {
 				utils.Debugf("[TUN] write: %v", err)
 			}
@@ -156,7 +158,7 @@ func (c *TUNClient) Start() {
 				continue
 			}
 			pkt := append([]byte(nil), bufs[0][:sizes[0]]...)
-			if err := c.trans.Send(pkt); err != nil {
+			if err := tunnel.SendFromDevice(c.trans, pkt); err != nil {
 				utils.Debugf("[TUN] send: %v", err)
 			}
 		}

@@ -1,7 +1,6 @@
 package transport
 
 import (
-	"bytes"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -279,6 +278,22 @@ func TestSessionClassicCompat(t *testing.T) {
 		ex := compatSession(t, b, "ctx", nil, true, true, CodecBatched)
 		roundTrip(t, cl, ex, 5*time.Second)
 	})
+	t.Run("a several-carrier exit serves a classic client on any of them", func(t *testing.T) {
+		// A wizard node: mailru, cupsonline and direct; the iOS app speaks
+		// classic on the mailru document.
+		_, idle := asyncPair()
+		a, b := asyncPair()
+		cl := oldClassic(t, a, CodecBatched, "ctx", false)
+		ex := compatSession(t, idle, "ctx", nil, true, true, CodecBatched)
+		if err := ex.AddTransport("mailru", b, compatSecret, "ctx", 90); err != nil {
+			t.Fatal(err)
+		}
+		roundTrip(t, cl, ex, 5*time.Second, func() {
+			if m := ex.Mode(); m != "classic" {
+				t.Errorf("exit mode %q", m)
+			}
+		})
+	})
 	t.Run("a Session-only exit does not serve classic clients", func(t *testing.T) {
 		a, b := asyncPair()
 		cl := oldClassic(t, a, CodecBatched, "ctx", false)
@@ -318,41 +333,61 @@ func TestSessionClassicYieldsToSession(t *testing.T) {
 	})
 }
 
+// The KDF PRIMARY is pinned: an explicit context (shared out of band, so it
+// cannot diverge) is honoured, everything else collapses to the one fixed
+// ContextPlaceholder, and a cups room list never becomes the primary. On top
+// of that the LEGACY derivation is offered as alternates, so a peer from a
+// pre-pin build (whose primary is a URL / room list) is still reached — the
+// context an old build would have used first, then the placeholder, --url, the
+// carrier URLs and the transport names. See KDFContexts, EncryptedTransport,
+// and the per-session hello challenges in control/control.go.
 func TestKDFContextsRule(t *testing.T) {
 	cases := []struct {
 		name, explicit, url string
 		specs               []ContextSource
 		want                string
+		wantAlts            []string
 	}{
-		{"explicit", "x", "https://u", nil, "x"},
-		{"--url", "", "https://u", []ContextSource{{Type: "mailru", URL: "https://m"}}, "https://u"},
-		{"highest priority", "", ContextPlaceholder, []ContextSource{
-			{Type: "mailru", URL: "https://m", Priority: 10}, {Type: "vyandex", URL: "https://v", Priority: 100}}, "https://v"},
-		{"classic cups rooms as --url", "", "rooms", []ContextSource{{Type: "cupsonline", URL: "rooms"}}, ContextPlaceholder},
-		{"direct address", "", ContextPlaceholder, []ContextSource{{Type: "direct", URL: "1.2.3.4:9443"}}, ContextPlaceholder},
+		{"explicit honoured", "x", "https://u", nil, "x",
+			[]string{ContextPlaceholder, "https://u"}},
+		{"explicit beats everything", "shared-link-ctx", "https://u",
+			[]ContextSource{{Type: "mailru", URL: "https://m", Priority: 100}}, "shared-link-ctx",
+			[]string{ContextPlaceholder, "https://u", "https://m", "mailru"}},
+		{"no explicit: placeholder primary, url is a legacy alternate", "", "https://u",
+			[]ContextSource{{Type: "mailru", URL: "https://m"}}, ContextPlaceholder,
+			[]string{"https://u", "https://m", "mailru"}},
+		{"no explicit: highest-priority spec is a legacy alternate", "", ContextPlaceholder,
+			[]ContextSource{{Type: "vyandex", URL: "https://v", Priority: 100}}, ContextPlaceholder,
+			[]string{"https://v", "vyandex"}},
+		{"cups room list never the primary, only a legacy alternate", "", "rooms",
+			[]ContextSource{{Type: "cupsonline", URL: "rooms"}}, ContextPlaceholder,
+			[]string{"rooms", "cupsonline"}},
 	}
 	for _, c := range cases {
 		got, alts := KDFContexts(c.explicit, c.url, c.specs)
 		if got != c.want {
-			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+			t.Errorf("%s: primary %q, want %q", c.name, got, c.want)
 		}
+		if !equalStrings(alts, c.wantAlts) {
+			t.Errorf("%s: alternates %q, want %q", c.name, alts, c.wantAlts)
+		}
+		// The primary must never be among its own alternates (no wasted try).
 		for _, a := range alts {
 			if a == got {
-				t.Errorf("%s: primary repeated among alternates", c.name)
+				t.Errorf("%s: primary %q repeated in alternates", c.name, got)
 			}
 		}
 	}
-	_, alts := KDFContexts("", "rooms", []ContextSource{{Type: "cupsonline", URL: "rooms"}})
-	if !bytes.Contains([]byte(joinStrings(alts)), []byte("rooms")) {
-		t.Errorf("old classic cups context missing from alternates %q", alts)
-	}
 }
 
-func joinStrings(s []string) string {
-	var b bytes.Buffer
-	for _, x := range s {
-		b.WriteString(x)
-		b.WriteByte('|')
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	return b.String()
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

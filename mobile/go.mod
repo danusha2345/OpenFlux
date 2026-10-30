@@ -1,10 +1,10 @@
 module openflux-mobile
 
-go 1.26.6
+go 1.26.10
 
 require (
 	github.com/p1neappleXpress/OpenFlux v0.0.0
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 )
 
 require (
@@ -51,5 +51,8 @@ require (
 )
 
 replace github.com/p1neappleXpress/OpenFlux => ..
+
+// The core's copy of pion/sctp with a settable packet size (third_party/sctp/OPENFLUX_PATCH.md); a replace of the core's own go.mod does not reach this module.
+replace github.com/pion/sctp => ../third_party/sctp
 
 tool golang.org/x/mobile/cmd/gobind

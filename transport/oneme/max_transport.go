@@ -1,6 +1,7 @@
 package oneme
 
 import (
+	"fmt"
 	"github.com/p1neappleXpress/OpenFlux/transport"
 	"github.com/p1neappleXpress/OpenFlux/utils"
 )
@@ -35,8 +36,13 @@ func NewOneMeTransport(isExit bool, maxToken string, maxUid int64, config transp
 func (t *OneMeTransport) Start() error {
 	utils.Debugf("creating max client ...")
 	t.oneMeClient = *NewMaxClient()
-	t.oneMeClient.Connect()
-	t.oneMeClient.LoginByToken(t.token)
+	if err := t.oneMeClient.Connect(); err != nil {
+		return fmt.Errorf("MAX connect: %w", err)
+	}
+	if err := t.oneMeClient.LoginByToken(t.token); err != nil {
+		_ = t.oneMeClient.conn.Close()
+		return fmt.Errorf("MAX login: %w", err)
+	}
 
 	if t.exit {
 		utils.Debugf("configured ch for exit node")

@@ -71,6 +71,10 @@ func (c *MaxClient) invoke(opcode int, payload map[string]interface{}) (*MaxPack
 	c.pending.Store(seq, ch)
 	defer c.pending.Delete(seq)
 	c.mu.Lock()
+	if c.conn == nil {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("MAX is not connected")
+	}
 	err := c.conn.WriteMessage(websocket.TextMessage, data)
 	c.mu.Unlock()
 	if err != nil {
@@ -85,7 +89,7 @@ func (c *MaxClient) invoke(opcode int, payload map[string]interface{}) (*MaxPack
 }
 
 func (c *MaxClient) LoginByToken(token string) error {
-	c.invoke(6, map[string]interface{}{
+	_, err := c.invoke(6, map[string]interface{}{
 		"userAgent": map[string]interface{}{
 			"deviceType": "WEB", "locale": "ru_RU", "osVersion": "macOS",
 			"deviceName": "vkmax Go", "appVersion": "25.9.15",
@@ -93,6 +97,9 @@ func (c *MaxClient) LoginByToken(token string) error {
 		},
 		"deviceId": c.deviceID,
 	})
+	if err != nil {
+		return err
+	}
 	resp, err := c.invoke(19, map[string]interface{}{
 		"interactive": true, "token": token, "chatsSync": 0,
 		"contactsSync": 0, "presenceSync": 0, "draftsSync": 0, "chatsCount": 40,
@@ -124,15 +131,25 @@ func (c *MaxClient) getUserMap(resp *MaxPacket) map[int64]UserInfo {
 	}
 	if contacts, ok := payload["contacts"].([]interface{}); ok {
 		for _, contact := range contacts {
-			cm := contact.(map[string]interface{})
-			id := int64(cm["id"].(float64))
+			cm, ok := contact.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			fid, ok := cm["id"].(float64)
+			if !ok {
+				continue
+			}
+			id := int64(fid)
 			u := UserInfo{ID: id}
 			if phone, ok := cm["phone"].(float64); ok {
 				u.Phone = int64(phone)
 			}
 			if names, ok := cm["names"].([]interface{}); ok {
 				for _, name := range names {
-					n := name.(map[string]interface{})
+					n, ok := name.(map[string]interface{})
+					if !ok {
+						continue
+					}
 					if n["type"] == "ONEME" {
 						if v, ok := n["firstName"].(string); ok {
 							u.FirstName = v

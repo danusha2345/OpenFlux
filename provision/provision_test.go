@@ -1,8 +1,12 @@
 package provision
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -62,5 +66,50 @@ func TestSudoRefusal(t *testing.T) {
 	}
 	if isSudoRefusal([]byte("sh: 1: foo: not found")) {
 		t.Fatal("unexpected refusal")
+	}
+}
+
+func TestCookieStoreFormat(t *testing.T) {
+	b64, signedIn, err := CookieStore("https://docs.yandex.ru/edit/d/x", " Session_id=a=b ; yandexuid=1;bad;\nx=y")
+	if err != nil || !signedIn {
+		t.Fatalf("%v %v", signedIn, err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(b64)
+	var store map[string]map[string]string
+	if err := json.Unmarshal(raw, &store); err != nil {
+		t.Fatal(err)
+	}
+	jar := store["https://docs.yandex.ru/edit/d/x"]
+	if jar["Session_id"] != "a=b" || jar["yandexuid"] != "1" || len(jar) != 3 {
+		t.Fatalf("jar = %v", jar)
+	}
+	if _, signedIn, _ := CookieStore("u", "yandexuid=1"); signedIn {
+		t.Fatal("no Session_id means not signed in")
+	}
+}
+
+func TestChannelInfoStringHidesTheKey(t *testing.T) {
+	info := ChannelInfo{Channel: "of-abc", State: "active", Port: 31337, Mode: "l3", Key: strings.Repeat("ab", 32)}
+	for _, s := range []string{info.String(), fmt.Sprintf("%v", info), fmt.Sprintf("%+v", &info)} {
+		if strings.Contains(s, "abab") {
+			t.Fatalf("the key is in %q", s)
+		}
+	}
+}
+
+// show's signin list (node-install.sh signin_json) reaches the app; an older
+// installer leaves it out.
+func TestChannelInfoSignIn(t *testing.T) {
+	var info ChannelInfo
+	out := []byte(`{"ok":true,"channel":"c1","state":"active","port":1,"context":"","mode":"l4","key":"","signin":[{"state":"login","since":1760000000,"doc":"https://disk.yandex.ru/i/x"}],"transports":[]}`)
+	if err := lastJSON(out, &info); err != nil {
+		t.Fatal(err)
+	}
+	if len(info.SignIn) != 1 || info.SignIn[0].State != "login" || info.SignIn[0].Since != 1760000000 || info.SignIn[0].Doc != "https://disk.yandex.ru/i/x" {
+		t.Fatalf("%+v", info.SignIn)
+	}
+	var old ChannelInfo
+	if err := lastJSON([]byte(`{"ok":true,"channel":"c1","transports":[]}`), &old); err != nil || old.SignIn != nil {
+		t.Fatalf("%v %v", err, old.SignIn)
 	}
 }

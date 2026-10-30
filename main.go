@@ -339,6 +339,7 @@ func main() {
 	ipcSocketPath := flag.String("ipc-socket", "",
 		"Path to the Unix domain socket used by the mobile app to talk to the core. "+
 			"Empty = no IPC server.")
+	bypassConfig := flag.String("bypass-config", "", "Client TUN: JSON VPN exceptions for LAN, domains and Windows applications")
 	allowPrivate := flag.Bool("allow-private", false, "Exit: allow private/link-local destinations")
 	socksAddr := flag.String("socks5", "127.0.0.1:1080", "SOCKS5 address")
 	upstreamProxy := flag.String("upstream-proxy", "", "Exit (l4): open TCP connections through this SOCKS5 proxy, e.g. 127.0.0.1:10808 or socks5://user:pass@host:port")
@@ -745,6 +746,16 @@ DEPRECATED (removed in v2)
 	}
 
 	requiresTUNProtection = *role == roleClient && *inbound == inboundTUN
+	if *bypassConfig != "" {
+		if !requiresTUNProtection || (runtime.GOOS != "windows" && runtime.GOOS != "linux") || *mode == "stream" {
+			log.Fatal("VPN exceptions require a Windows/Linux TUN client with an IP exit")
+		}
+		var err error
+		tunBypass, err = loadBypass(*bypassConfig)
+		if err != nil {
+			log.Fatalf("VPN exceptions: %v", err)
+		}
+	}
 
 	// Windows full tunnel: bind the core's sockets to the real interface
 	// before any transport dials, so the carriers stay out of the tunnel
@@ -1463,6 +1474,17 @@ func runClient(trans transport.Transport, inbound, socksAddr, httpProxyAddr stri
 }
 
 func runClientTUN(trans transport.Transport) {
+	// Save/bind the physical interface before making any direct exception sockets.
+	if tunBypass.Enabled() && !netbind.Bound() {
+		if _, err := netbind.BindDefault(); err != nil {
+			log.Fatalf("VPN exceptions: %v", err)
+		}
+	}
+	routed, closeRouting, err := splitTransport(trans)
+	if err != nil {
+		log.Fatalf("VPN exceptions: %v", err)
+	}
+	trans = routed
 	tc, err := NewTUNClient(trans, 1280)
 	if err != nil {
 		log.Fatalf("utun: %v", err)
@@ -1517,6 +1539,7 @@ func runClientTUN(trans transport.Transport) {
 		log.Printf("cleanup warning: %v", err)
 	}
 	tc.RestoreDefault()
+	closeRouting()
 	log.Printf("Shutdown complete")
 	if setupErr != nil {
 		log.Fatalf("configure full tunnel: %v", setupErr)

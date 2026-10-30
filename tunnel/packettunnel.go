@@ -93,7 +93,15 @@ func (pt *PacketTunnel) handleTCP(r *tcp.ForwarderRequest) {
 	local := gonet.NewTCPConn(&wq, ep)
 
 	utils.SafeGo("pkt.flow", func() {
-		remote, err := pt.dialer.DialTCP(dest)
+		var remote net.Conn
+		var err error
+		if d, ok := pt.dialer.(interface {
+			DialTCPFrom(string, string) (net.Conn, error)
+		}); ok {
+			remote, err = d.DialTCPFrom(net.JoinHostPort(id.RemoteAddress.String(), fmt.Sprint(id.RemotePort)), dest)
+		} else {
+			remote, err = pt.dialer.DialTCP(dest)
+		}
 		if err != nil {
 			utils.Debugf("[PKT] dial %s failed: %v", dest, err)
 			local.Close()
@@ -123,7 +131,15 @@ func (pt *PacketTunnel) handleUDP(r *udp.ForwarderRequest) bool {
 	dest := net.JoinHostPort(id.LocalAddress.String(), fmt.Sprintf("%d", id.LocalPort))
 
 	if dialer, ok := pt.dialer.(UDPDialer); ok {
-		remote, err := dialer.DialUDP(dest)
+		var remote net.Conn
+		var err error
+		if d, ok := pt.dialer.(interface {
+			DialUDPFrom(string, string) (net.Conn, error)
+		}); ok {
+			remote, err = d.DialUDPFrom(net.JoinHostPort(id.RemoteAddress.String(), fmt.Sprint(id.RemotePort)), dest)
+		} else {
+			remote, err = dialer.DialUDP(dest)
+		}
 		if err != nil {
 			utils.Debugf("[PKT] UDP dial %s: %v", dest, err)
 			conn.Close()

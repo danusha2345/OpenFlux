@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/p1neappleXpress/OpenFlux/netbind"
+	"github.com/p1neappleXpress/OpenFlux/routing"
 	"github.com/p1neappleXpress/OpenFlux/transport"
 	"github.com/p1neappleXpress/OpenFlux/tunnel"
 	"github.com/p1neappleXpress/OpenFlux/utils"
@@ -78,7 +79,7 @@ func (c *TUNClient) SetupInterface() error {
 // The inet output hook covers both IP families, including sockets bound to
 // another interface. Only marked carrier sockets and local IPC bypass TUN.
 func linuxGuardScript(table, iface string) string {
-	return fmt.Sprintf(`add table inet %s
+	script := fmt.Sprintf(`add table inet %s
 add chain inet %s output { type filter hook output priority -150; policy drop; }
 add rule inet %s output oifname "lo" accept
 add rule inet %s output meta mark 0x%x accept
@@ -86,6 +87,20 @@ add rule inet %s output meta nfproto ipv6 reject
 add rule inet %s output oifname %q accept
 add rule inet %s output udp sport 68 udp dport 67 accept
 `, table, table, table, table, netbind.SocketMark, table, table, iface, table)
+	if tunBypass != nil && tunBypass.LAN {
+		var rules string
+		for _, p := range routing.LANPrefixes() {
+			family := "ip"
+			if p.Addr().Is6() {
+				family = "ip6"
+			}
+			rules += fmt.Sprintf("add rule inet %s output %s daddr %s accept\n", table, family, p)
+		}
+		// Insert before the IPv6 reject; keep loopback and marked-socket rules.
+		marker := fmt.Sprintf("add rule inet %s output meta nfproto ipv6 reject", table)
+		script = strings.Replace(script, marker, rules+marker, 1)
+	}
+	return script
 }
 func (c *TUNClient) ConfigureDefault() error {
 	// A separate process waits for this pipe to close. On SIGKILL or a

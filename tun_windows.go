@@ -102,6 +102,11 @@ func (c *TUNClient) SaveDefault() error {
 
 // SetupInterface gives the adapter its addresses and MTU.
 func (c *TUNClient) SetupInterface() error {
+	if tunBypass.Enabled() {
+		if out, err := exec.Command("ipconfig", "/flushdns").CombinedOutput(); err != nil {
+			return fmt.Errorf("clear stale DNS cache: %w: %s", err, out)
+		}
+	}
 	idx := strconv.Itoa(int(c.index))
 	steps := [][]string{
 		{"interface", "ipv4", "set", "address", "name=" + idx, "source=static", "address=" + localIPv4, "mask=" + localMask, "store=active"},
@@ -129,7 +134,7 @@ func (c *TUNClient) ConfigureDefault() error {
 	// Dynamic WFP filters block physical-interface bypass, including WebRTC,
 	// even when another adapter has a more specific route. The OS removes
 	// these filters if the process dies; no persistent firewall changes.
-	if err := firewall.EnableFirewall(c.luid, false, []netip.Addr{netip.MustParseAddr("1.1.1.1")}); err != nil {
+	if err := firewall.EnableFirewall(c.luid, false, []netip.Addr{netip.MustParseAddr("1.1.1.1")}, tunBypass != nil && tunBypass.LAN); err != nil {
 		return fmt.Errorf("защита от утечек WFP: %w", err)
 	}
 	c.firewallEnabled = true
@@ -205,6 +210,9 @@ func (c *TUNClient) Close() error {
 		return nil
 	}
 	err := c.dev.Close()
+	if tunBypass.Enabled() {
+		_ = exec.Command("ipconfig", "/flushdns").Run()
+	}
 	if c.firewallEnabled {
 		firewall.DisableFirewall()
 		c.firewallEnabled = false

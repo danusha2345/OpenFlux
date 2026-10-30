@@ -132,7 +132,9 @@ func TestSplitTransportPacketPathAndOriginalOwnerTuple(t *testing.T) {
 	direct := &routeRecorder{calls: make(chan string, 8)}
 	ownerCalls := make(chan string, 8)
 	owner := func(n, src, dst string) (string, error) {
-		ownerCalls <- n + " " + src + " " + dst
+		if !strings.HasSuffix(dst, ":53") {
+			ownerCalls <- n + " " + src + " " + dst
+		}
 		if dst == "203.0.113.7:51413" {
 			return `C:\Torrent\any-torrent.exe`, nil
 		}
@@ -276,5 +278,28 @@ func TestLocalDNSRecordsUsePhysicalResolverWithoutExposingPublicDNS(t *testing.T
 	case x := <-vpn.calls:
 		t.Fatal("A records should be synthetic before connection", x)
 	default:
+	}
+}
+
+func TestExcludedApplicationDoesNotMistakePort53ForDNS(t *testing.T) {
+	vpn := &routeRecorder{make(chan string, 2)}
+	direct := &routeRecorder{make(chan string, 2)}
+	p, _ := routing.New(routing.Config{Apps: []string{"anything.exe"}})
+	d := NewSplitDialer(p, vpn, direct.connect, func(string, string, string) (string, error) { return `C:\Torrent\anything.exe`, nil })
+	c, e := d.DialUDPFrom("10.10.10.2:50000", "203.0.113.7:53")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(time.Second))
+	if _, e = c.Write([]byte("not a DNS packet")); e != nil {
+		t.Fatal(e)
+	}
+	b := make([]byte, 16)
+	if _, e = io.ReadFull(c, b); e != nil || string(b) != "not a DNS packet" {
+		t.Fatal(string(b), e)
+	}
+	if got := <-direct.calls; got != "udp:203.0.113.7:53" {
+		t.Fatal(got)
 	}
 }

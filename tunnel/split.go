@@ -44,15 +44,14 @@ func (d *SplitDialer) dial(network, source, dest string) (net.Conn, error) {
 	if e != nil {
 		return nil, e
 	}
-	if port == "53" {
-		return d.dnsConn(network), nil
-	}
+	synthetic := false
 	if ip := net.ParseIP(host).To4(); ip != nil && ip[0] == 198 && ip[1] == 18 {
 		name, ok := d.dns.nameFor([4]byte(ip))
 		if !ok {
 			return nil, fmt.Errorf("unknown split DNS address")
 		}
 		host = name
+		synthetic = true
 	}
 	direct := d.Policy.Domain(host) || d.Policy.Local(host)
 	if !direct && d.Owner != nil && source != "" {
@@ -65,6 +64,9 @@ func (d *SplitDialer) dial(network, source, dest string) (net.Conn, error) {
 	target := net.JoinHostPort(host, port)
 	if direct {
 		return d.Direct(network, target)
+	}
+	if port == "53" && !synthetic {
+		return d.dnsConn(network), nil
 	}
 	if network == "udp" {
 		return d.VPN.DialUDP(target)

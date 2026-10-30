@@ -134,7 +134,12 @@ func (c *TUNClient) ConfigureDefault() error {
 	// Dynamic WFP filters block physical-interface bypass, including WebRTC,
 	// even when another adapter has a more specific route. The OS removes
 	// these filters if the process dies; no persistent firewall changes.
-	if err := firewall.EnableFirewall(c.luid, false, []netip.Addr{netip.MustParseAddr("1.1.1.1")}, tunBypass != nil && tunBypass.LAN); err != nil {
+	var exceptions firewall.Exceptions
+	if tunBypass != nil {
+		exceptions.LAN = tunBypass.LAN
+		exceptions.Apps = tunBypass.Apps
+	}
+	if err := firewall.EnableFirewall(c.luid, false, []netip.Addr{netip.MustParseAddr("1.1.1.1")}, exceptions); err != nil {
 		return fmt.Errorf("защита от утечек WFP: %w", err)
 	}
 	c.firewallEnabled = true
